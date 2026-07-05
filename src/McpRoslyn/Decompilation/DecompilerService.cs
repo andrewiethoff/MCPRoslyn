@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
+using ICSharpCode.Decompiler.Documentation;
 using ICSharpCode.Decompiler.TypeSystem;
 using McpRoslyn.Infrastructure;
 using McpRoslyn.Symbols;
@@ -157,16 +158,33 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
             _ => -1,
         };
 
-        var members = typeDefinition.Members
-            .Where(m => wantCtor
-                ? m is IMethod { IsConstructor: true }
-                : string.Equals(m.Name, symbol.MetadataName, StringComparison.Ordinal)
-                  || string.Equals(m.Name, symbol.Name, StringComparison.Ordinal))
-            .Where(m => parameterCount < 0
-                        || m is not IParameterizedMember pm
-                        || pm.Parameters.Count == parameterCount)
-            .Take(3)
-            .ToList();
+        // Prefer an exact match on the XML documentation id: it encodes the full signature
+        // (parameter types, generic arity, indexer parameters) so overloads with the same name and
+        // arity resolve to the one the caller actually asked for, not an arbitrary sibling.
+        var docId = symbol.GetDocumentationCommentId();
+        List<IMember> members;
+        var exact = docId is null
+            ? null
+            : typeDefinition.Members.FirstOrDefault(m => IdMatches(m, docId));
+        if (exact is not null)
+        {
+            members = [exact];
+        }
+        else
+        {
+            // Fallback (compiler-generated / IL-renamed members whose ids will not match): name and
+            // parameter count, capped so an ambiguous match at least shows the candidates.
+            members = typeDefinition.Members
+                .Where(m => wantCtor
+                    ? m is IMethod { IsConstructor: true }
+                    : string.Equals(m.Name, symbol.MetadataName, StringComparison.Ordinal)
+                      || string.Equals(m.Name, symbol.Name, StringComparison.Ordinal))
+                .Where(m => parameterCount < 0
+                            || m is not IParameterizedMember pm
+                            || pm.Parameters.Count == parameterCount)
+                .Take(3)
+                .ToList();
+        }
 
         if (members.Count == 0)
             throw new ToolException(
@@ -181,6 +199,23 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
             sb.AppendLine(decompiler.DecompileAsString(member.MetadataToken));
         }
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// True when a decompiler member's XML documentation id equals the Roslyn symbol's. Both follow
+    /// the ECMA-334 doc-id format, so this is an exact signature comparison.
+    /// </summary>
+    private static bool IdMatches(IEntity member, string docId)
+    {
+        try
+        {
+            return string.Equals(IdStringProvider.GetIdString(member), docId, StringComparison.Ordinal);
+        }
+        catch
+        {
+            // Some synthesized members throw while building an id; treat as no match.
+            return false;
+        }
     }
 
     /// <summary>The requested assembly, plus runtime-implementation fallbacks for reference assemblies.</summary>

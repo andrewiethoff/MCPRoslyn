@@ -185,7 +185,7 @@ public static class NavigationTools
             }
 
             var unique = results
-                .GroupBy(s => s.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(s))
+                .GroupBy(SymbolFormat.IdentityKey)
                 .Select(g => g.First())
                 .OrderBy(SymbolFormat.FqnOf, StringComparer.OrdinalIgnoreCase)
                 .ToList();
@@ -250,7 +250,7 @@ public static class NavigationTools
                 }
 
                 var unique = derived
-                    .GroupBy(s => s.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(s))
+                    .GroupBy(SymbolFormat.IdentityKey)
                     .Select(g => g.First())
                     .OrderBy(SymbolFormat.FqnOf, StringComparer.OrdinalIgnoreCase)
                     .ToList();

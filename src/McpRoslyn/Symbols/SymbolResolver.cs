@@ -47,7 +47,7 @@ public static class SymbolResolver
                 matches = exact;
         }
 
-        matches = DedupeByDocId(matches);
+        matches = DedupeByIdentity(matches);
 
         switch (matches.Count)
         {
@@ -61,10 +61,18 @@ public static class SymbolResolver
                         ? " Similar declarations:\n  " + string.Join("\n  ", suggestions)
                         : " Use search_symbols to explore."));
             default:
+                // Distinct declarations that happen to share a fully-qualified name (e.g. the same
+                // type defined in two projects) also share a doc-id, so print the project and
+                // location too — that is what actually tells them apart.
                 var lines = matches.Take(10).Select(m =>
-                    $"{m.Symbol.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(m.Symbol)}  ({SymbolFormat.KindOf(m.Symbol)})");
+                {
+                    var id = m.Symbol.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(m.Symbol);
+                    var where = SymbolFormat.PrimaryLocation(m.Symbol, p => p is null ? "?" : Path.GetFileName(p));
+                    return $"{id}  ({SymbolFormat.KindOf(m.Symbol)}) — project {m.Project.Name} @ {where}";
+                });
                 throw new ToolException(
-                    $"'{query}' is ambiguous — {matches.Count} matches. Re-call with one of:\n  " + string.Join("\n  ", lines));
+                    $"'{query}' is ambiguous — {matches.Count} matches. Address one declaration by file+line "
+                    + "(get_symbol), or narrow the name:\n  " + string.Join("\n  ", lines));
         }
     }
 
@@ -428,10 +436,9 @@ public static class SymbolResolver
 
     // ---------------------------------------------------------------- misc
 
-    private static List<ResolvedSymbol> DedupeByDocId(List<ResolvedSymbol> matches) =>
+    private static List<ResolvedSymbol> DedupeByIdentity(List<ResolvedSymbol> matches) =>
         matches
-            .GroupBy(m => m.Symbol.GetDocumentationCommentId()
-                          ?? $"{SymbolFormat.FqnOf(m.Symbol)}|{m.Symbol.Kind}")
+            .GroupBy(m => SymbolFormat.IdentityKey(m.Symbol))
             .Select(g => g.OrderByDescending(m => m.Symbol.Locations.Any(l => l.IsInSource)).First())
             .ToList();
 

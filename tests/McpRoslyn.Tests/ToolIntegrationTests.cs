@@ -167,6 +167,36 @@ public class ToolIntegrationTests(FixtureWorkspace fixture)
     }
 
     [Fact]
+    public async Task AnalyzeImpact_BenignLineShiftIsNotABreak()
+    {
+        // Inserting a blank line shifts every subsequent line — but introduces no real problem.
+        // A line-sensitive diff would misreport the pre-existing CS0169 as resolved-and-reintroduced.
+        var path = Path.Combine(Path.GetDirectoryName(FixtureWorkspace.SolutionPath)!, "FixtureCore", "Processor.cs");
+        var original = await File.ReadAllTextAsync(path, Ct);
+        var shifted = "\n" + original;
+
+        var output = await AnalysisTools.AnalyzeImpact(Ws, Lf, Ct, file: "Processor.cs", new_content: shifted);
+        Assert.Contains("✔", output);
+        Assert.DoesNotContain("✖", output);
+        // Real file untouched (in-memory only).
+        Assert.Equal(original, await File.ReadAllTextAsync(path, Ct));
+    }
+
+    [Fact]
+    public async Task Decompile_MetadataOverloadIsExact()
+    {
+        // Convert.ToInt32 has ~20 same-arity overloads. Matching by name+arity alone would return
+        // arbitrary siblings; matching by documentation id returns exactly the bool overload,
+        // whose body is the distinctive ternary 'value ? 1 : 0'.
+        var output = await DecompileTools.Decompile(Ws, fixture.Decompiler, Lf, Ct, "System.Convert.ToInt32(bool)");
+        Assert.Contains("ToInt32", output);
+        Assert.Contains("bool", output);
+        Assert.Contains("1 : 0", output);
+        Assert.DoesNotContain("ToInt32(string", output);
+        Assert.DoesNotContain("ToInt32(decimal", output);
+    }
+
+    [Fact]
     public async Task AnalyzeImpact_SpeculativeBreakingEdit()
     {
         var original = await File.ReadAllTextAsync(

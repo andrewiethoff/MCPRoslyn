@@ -45,6 +45,28 @@ public static class SymbolFormat
 
     public static string SignatureOf(ISymbol symbol) => symbol.ToDisplayString(Signature);
 
+    /// <summary>
+    /// Stable identity key that collapses genuine duplicates while keeping distinct declarations
+    /// apart. Source symbols key on their declaration file+span set, so a symbol seen once per
+    /// multi-target TFM flavor (same file, same span) collapses to one, but two different projects
+    /// declaring the same fully-qualified name stay separate. Metadata symbols key on the
+    /// containing assembly's identity plus documentation id, so the same referenced assembly
+    /// reached through several projects collapses while different assembly versions do not.
+    /// </summary>
+    public static string IdentityKey(ISymbol symbol)
+    {
+        var sourceSpans = symbol.Locations
+            .Where(l => l.IsInSource && l.SourceTree is not null)
+            .Select(l => $"{l.SourceTree!.FilePath}:{l.SourceSpan.Start}:{l.SourceSpan.Length}")
+            .OrderBy(s => s, StringComparer.Ordinal)
+            .ToList();
+        if (sourceSpans.Count > 0)
+            return "S|" + string.Join(";", sourceSpans);
+
+        var assembly = symbol.ContainingAssembly?.Identity.GetDisplayName() ?? "?";
+        return "M|" + assembly + "|" + (symbol.GetDocumentationCommentId() ?? FqnOf(symbol) + symbol.Kind);
+    }
+
     public static string KindOf(ISymbol symbol) => symbol switch
     {
         INamedTypeSymbol nt => nt.TypeKind switch

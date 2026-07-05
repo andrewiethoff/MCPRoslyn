@@ -43,7 +43,7 @@ public static class SearchTools
                 .Where(s => s.Kind is not SymbolKind.Alias and not SymbolKind.Local and not SymbolKind.Parameter)
                 .Where(s => kindFilter is null or "" || MatchesKind(s, kindFilter))
                 .Where(s => project is null || ToolHelpers.ProjectOf(solution, s)?.Name.Contains(project, StringComparison.OrdinalIgnoreCase) == true)
-                .GroupBy(s => s.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(s) + s.Kind)
+                .GroupBy(SymbolFormat.IdentityKey)
                 .Select(g => g.First())
                 .OrderBy(s => s.Name.Length)
                 .ThenBy(s => SymbolFormat.FqnOf(s), StringComparer.OrdinalIgnoreCase)

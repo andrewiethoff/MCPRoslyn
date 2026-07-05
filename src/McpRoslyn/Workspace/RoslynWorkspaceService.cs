@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Xml.Linq;
 using McpRoslyn.Infrastructure;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
@@ -53,6 +54,7 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
     private readonly ConcurrentDictionary<string, byte> _changedProjectFiles = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _readFailureRounds = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _unreadableFiles = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, bool> _implicitCompileItems = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<FileSystemWatcher> _watchers = [];
     private readonly List<string> _loadDiagnostics = [];
 
@@ -493,24 +495,32 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
     {
         ClearWatchers();
         _resyncNeeded = false;
+        _implicitCompileItems.Clear();
         Interlocked.Exchange(ref _unwatchedRoots, 0);
 
-        var roots = new List<string>();
+        // Watch the directory of every loaded document, not just project-file directories: a
+        // project can pull in linked/shared source with a relative Compile Include that lives
+        // outside its own folder, and edits there must still be seen.
+        var candidateRoots = new List<string>();
         var solutionDir = SolutionDirectory;
         if (solutionDir is not null)
-            roots.Add(solutionDir);
+            candidateRoots.Add(solutionDir);
 
+        var dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var project in solution.Projects)
         {
-            var dir = Path.GetDirectoryName(project.FilePath);
-            if (dir is null)
-                continue;
-            if (!roots.Any(r => IsUnder(dir, r)))
-                roots.Add(dir);
+            if (Path.GetDirectoryName(project.FilePath) is { } projectDir)
+                dirs.Add(projectDir);
+            foreach (var document in project.Documents)
+            {
+                if (document.FilePath is { } docPath && Path.GetDirectoryName(docPath) is { } docDir)
+                    dirs.Add(docDir);
+            }
         }
+        candidateRoots.AddRange(dirs);
 
-        // Reduce to a minimal set of roots.
-        roots = roots
+        // Reduce to a minimal set of roots (drop any directory already covered by a parent).
+        var roots = candidateRoots
             .OrderBy(r => r.Length)
             .Aggregate(new List<string>(), (acc, r) =>
             {
@@ -545,11 +555,7 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
             watcher.Changed += (_, e) => OnFsEvent(e.FullPath, WatcherChangeTypes.Changed);
             watcher.Created += (_, e) => OnFsEvent(e.FullPath, WatcherChangeTypes.Created);
             watcher.Deleted += (_, e) => OnFsEvent(e.FullPath, WatcherChangeTypes.Deleted);
-            watcher.Renamed += (_, e) =>
-            {
-                OnFsEvent(e.OldFullPath, WatcherChangeTypes.Deleted);
-                OnFsEvent(e.FullPath, WatcherChangeTypes.Created);
-            };
+            watcher.Renamed += (_, e) => OnRenamed(e.OldFullPath, e.FullPath);
             watcher.Error += (_, _) => _resyncNeeded = true;
             watcher.EnableRaisingEvents = true;
             target.Add(watcher);
@@ -581,6 +587,32 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
         {
             _changedProjectFiles.TryAdd(fullPath, 0);
         }
+    }
+
+    private void OnRenamed(string oldPath, string newPath)
+    {
+        // A directory rename raises ONE event for the directory, never one per contained file, so
+        // the plain (extension-based) path would drop it and leave every file under it stale.
+        // Detect the directory case and reconcile: request a timestamp resync (which removes the
+        // documents whose old paths vanished) and enqueue the renamed tree's source/build files.
+        if (Directory.Exists(newPath))
+        {
+            _resyncNeeded = true;
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(newPath, "*", SearchOption.AllDirectories))
+                    OnFsEvent(file, WatcherChangeTypes.Created);
+            }
+            catch (Exception ex)
+            {
+                // Enumeration is best-effort; the resync flag still forces a timestamp reconcile.
+                log.LogDebug(ex, "Could not enumerate renamed directory {Path}", newPath);
+            }
+            return;
+        }
+
+        OnFsEvent(oldPath, WatcherChangeTypes.Deleted);
+        OnFsEvent(newPath, WatcherChangeTypes.Created);
     }
 
     private static bool ContainsIgnoredSegment(string path)
@@ -675,15 +707,20 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
                     }
                     else
                     {
-                        // New file: attach to every project (all TFM flavors) whose directory
-                        // contains it and whose language matches — mirroring SDK-style globbing.
+                        // New file: attach to the nearest matching project(s) — but only when that
+                        // project uses SDK-style implicit globbing. Legacy projects with explicit
+                        // <Compile Include> items (or SDK projects that disable default items) do
+                        // not necessarily include a file just because it sits in the directory, so
+                        // guessing membership would be wrong. For those, flag the project stale and
+                        // let the user reload deliberately.
                         var language = Path.GetExtension(path).Equals(".vb", StringComparison.OrdinalIgnoreCase)
                             ? LanguageNames.VisualBasic
                             : LanguageNames.CSharp;
 
                         var owners = solution.Projects
                             .Where(p => p.Language == language && p.FilePath is not null
-                                        && IsUnder(path, Path.GetDirectoryName(p.FilePath)!))
+                                        && IsUnder(path, Path.GetDirectoryName(p.FilePath)!)
+                                        && ProjectImplicitlyIncludesSources(p.FilePath!))
                             .GroupBy(p => Path.GetDirectoryName(p.FilePath)!, StringComparer.OrdinalIgnoreCase)
                             .OrderByDescending(g => g.Key.Length)
                             .FirstOrDefault();
@@ -698,6 +735,15 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
                                     text,
                                     filePath: path);
                             }
+                        }
+                        else
+                        {
+                            var nearest = solution.Projects
+                                .Where(p => p.FilePath is not null && IsUnder(path, Path.GetDirectoryName(p.FilePath)!))
+                                .OrderByDescending(p => p.FilePath!.Length)
+                                .FirstOrDefault();
+                            if (nearest?.FilePath is { } projectFile)
+                                _changedProjectFiles.TryAdd(projectFile, 0);
                         }
                     }
                 }
@@ -726,6 +772,39 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
             }
         }
     }
+
+    /// <summary>
+    /// True when a project uses SDK-style implicit compile globbing (so a source file appearing in
+    /// its directory really does become part of it). False for legacy non-SDK projects with explicit
+    /// Compile items, and for SDK projects that set EnableDefaultCompileItems/EnableDefaultItems to
+    /// false. When we cannot tell, we answer false and require a deliberate reload — never guess a
+    /// file into the wrong project. Cached per project file; the cache is cleared on every load.
+    /// </summary>
+    private bool ProjectImplicitlyIncludesSources(string projectFilePath) =>
+        _implicitCompileItems.GetOrAdd(projectFilePath, static path =>
+        {
+            try
+            {
+                var root = XDocument.Load(path).Root;
+                if (root is null)
+                    return false;
+
+                var isSdkStyle = root.Attribute("Sdk") is not null
+                    || root.Elements().Any(e => e.Name.LocalName is "Sdk")
+                    || root.Elements().Any(e => e.Name.LocalName == "Import" && e.Attribute("Sdk") is not null);
+                if (!isSdkStyle)
+                    return false;
+
+                var defaultsDisabled = root.Descendants()
+                    .Where(e => e.Name.LocalName is "EnableDefaultCompileItems" or "EnableDefaultItems")
+                    .Any(e => string.Equals(e.Value.Trim(), "false", StringComparison.OrdinalIgnoreCase));
+                return !defaultsDisabled;
+            }
+            catch
+            {
+                return false;
+            }
+        });
 
     private static async Task<SourceText?> TryReadFileAsync(string path, CancellationToken ct)
     {

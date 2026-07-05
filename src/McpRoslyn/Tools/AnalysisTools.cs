@@ -29,7 +29,7 @@ public static class AnalysisTools
         string? target = null,
         [Description("error|warning|info|hidden (default warning).")]
         string? min_severity = null,
-        [Description("Also run the project's Roslyn analyzers (CA/IDE rules). Slower; executes analyzer assemblies referenced by the project. File scope runs tree-scoped analysis (skips whole-project rules).")]
+        [Description("Also run the project's Roslyn analyzers (CA/IDE rules). Slower, and OUTSIDE the read-only guarantee: this loads and executes the third-party analyzer assemblies the project references in-process, which is trusted-code execution. Off by default. File scope runs tree-scoped analysis (skips whole-project rules).")]
         bool include_analyzers = false,
         [Description("Page size, 1-200 (default 50).")]
         int max_results = 50,
@@ -57,12 +57,22 @@ public static class AnalysisTools
             else if (target is { Length: > 0 })
             {
                 var project = ToolHelpers.FindProject(solution, target);
-                diagnostics.AddRange(await ProjectDiagnosticsAsync(project, include_analyzers, minSeverity, ct));
-                scopeDescription = $"project {project.Name}";
+                // Check every target framework of the project — a diagnostic can be TFM-specific
+                // (behind #if guards or per-TFM APIs). Duplicates across TFMs collapse downstream.
+                var flavors = AllTfmFlavors(solution, project);
+                foreach (var flavor in flavors)
+                    diagnostics.AddRange(await ProjectDiagnosticsAsync(flavor, include_analyzers, minSeverity, ct));
+                scopeDescription = flavors.Count > 1
+                    ? $"project {StripTfm(project.Name)} (all {flavors.Count} target frameworks)"
+                    : $"project {project.Name}";
             }
             else
             {
-                var projects = SymbolResolver.DistinctByProjectFile(solution).ToList();
+                // Every project flavor, all TFMs — TFM-specific diagnostics only surface under
+                // their own framework. The DiagnosticKey dedupe below collapses cross-TFM copies.
+                var projects = solution.Projects.ToList();
+                var distinctProjects = projects
+                    .GroupBy(p => p.FilePath ?? p.Name, StringComparer.OrdinalIgnoreCase).Count();
                 var semaphore = new SemaphoreSlim(4);
                 var tasks = projects.Select(async p =>
                 {
@@ -78,7 +88,7 @@ public static class AnalysisTools
                 });
                 foreach (var set in await Task.WhenAll(tasks))
                     diagnostics.AddRange(set);
-                scopeDescription = $"solution ({projects.Count} projects; multi-TFM projects checked for their first TFM)";
+                scopeDescription = $"solution ({distinctProjects} project(s), all target frameworks)";
             }
 
             var rows = diagnostics
@@ -150,6 +160,22 @@ public static class AnalysisTools
         var span = d.Location.GetLineSpan();
         return $"{d.Id}|{span.Path}|{span.StartLinePosition.Line}|{d.GetMessage()}";
     }
+
+    /// <summary>
+    /// Line-insensitive identity for a diagnostic, used to diff two compilations. Excluding the
+    /// line number means a benign edit that only shifts subsequent lines (inserting a blank line,
+    /// say) is not misreported as resolving the old diagnostic and introducing an identical new one.
+    /// </summary>
+    private static string DiagnosticMatchKey(Diagnostic d) =>
+        $"{d.Id}|{d.Location.GetLineSpan().Path}|{d.GetMessage()}";
+
+    /// <summary>All target-framework flavors of a project (identified by shared project file path).</summary>
+    private static List<Project> AllTfmFlavors(Solution solution, Project project) =>
+        project.FilePath is null
+            ? [project]
+            : solution.Projects
+                .Where(p => string.Equals(p.FilePath, project.FilePath, StringComparison.OrdinalIgnoreCase))
+                .ToList();
 
     private static string RenderDiagnostic(Diagnostic d, RoslynWorkspaceService workspace)
     {
@@ -576,49 +602,64 @@ public static class AnalysisTools
                 affectedIds.Add(dependent);
         }
 
-        // Dedupe multi-TFM flavors; cap for runtime.
-        var affectedProjects = affectedIds
+        // Group by logical project (file), but compile EVERY TFM flavor — a break can exist only
+        // under a non-first target framework. Results are merged per logical project.
+        var affectedByProject = affectedIds
             .Select(id => solution.GetProject(id)!)
             .GroupBy(p => p.FilePath ?? p.Name, StringComparer.OrdinalIgnoreCase)
-            .Select(g => g.First())
-            .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(g => g.First().Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         const int projectCap = 20;
-        var capNote = affectedProjects.Count > projectCap
-            ? $" (limited to the first {projectCap} of {affectedProjects.Count} affected projects)"
+        var capNote = affectedByProject.Count > projectCap
+            ? $" (limited to the first {projectCap} of {affectedByProject.Count} affected projects)"
             : "";
 
         var sb = new StringBuilder();
         sb.AppendLine($"speculative edit of {workspace.RelPath(documents[0].FilePath)} — "
-                      + $"{affectedProjects.Count} affected project(s){capNote}. In-memory only; no files changed.");
+                      + $"{affectedByProject.Count} affected project(s){capNote}. In-memory only; no files changed.");
 
         var totalNew = 0;
         var totalFixed = 0;
 
-        foreach (var project in affectedProjects.Take(projectCap))
+        foreach (var projectGroup in affectedByProject.Take(projectCap))
         {
             ct.ThrowIfCancellationRequested();
-            var oldCompilation = await project.GetCompilationAsync(ct);
-            var newProject = newSolution.GetProject(project.Id);
-            var newCompilation = newProject is null ? null : await newProject.GetCompilationAsync(ct);
-            if (oldCompilation is null || newCompilation is null)
-                continue;
 
-            var oldDiagnostics = Significant(oldCompilation.GetDiagnostics(ct));
-            var newDiagnostics = Significant(newCompilation.GetDiagnostics(ct));
+            // Merge introduced/resolved across this project's TFM flavors, keyed line-insensitively
+            // so a benign line shift is never reported as a break.
+            var introducedByKey = new Dictionary<string, Diagnostic>();
+            var resolvedKeys = new HashSet<string>();
 
-            var oldKeys = oldDiagnostics.Select(DiagnosticKey).ToHashSet();
-            var newKeys = newDiagnostics.Select(DiagnosticKey).ToHashSet();
+            foreach (var project in projectGroup)
+            {
+                var oldCompilation = await project.GetCompilationAsync(ct);
+                var newProject = newSolution.GetProject(project.Id);
+                var newCompilation = newProject is null ? null : await newProject.GetCompilationAsync(ct);
+                if (oldCompilation is null || newCompilation is null)
+                    continue;
 
-            var introduced = newDiagnostics.Where(d => !oldKeys.Contains(DiagnosticKey(d))).ToList();
-            var resolved = oldDiagnostics.Count(d => !newKeys.Contains(DiagnosticKey(d)));
+                var oldDiagnostics = Significant(oldCompilation.GetDiagnostics(ct));
+                var newDiagnostics = Significant(newCompilation.GetDiagnostics(ct));
+
+                var oldKeys = oldDiagnostics.Select(DiagnosticMatchKey).ToHashSet();
+                var newKeys = newDiagnostics.Select(DiagnosticMatchKey).ToHashSet();
+
+                foreach (var d in newDiagnostics.Where(d => !oldKeys.Contains(DiagnosticMatchKey(d))))
+                    introducedByKey.TryAdd(DiagnosticMatchKey(d), d);
+                foreach (var d in oldDiagnostics.Where(d => !newKeys.Contains(DiagnosticMatchKey(d))))
+                    resolvedKeys.Add(DiagnosticMatchKey(d));
+            }
+
+            var introduced = introducedByKey.Values.ToList();
+            var resolved = resolvedKeys.Count;
             totalNew += introduced.Count;
             totalFixed += resolved;
 
+            var name = StripTfm(projectGroup.First().Name);
             if (introduced.Count > 0)
             {
-                sb.AppendLine($"{StripTfm(project.Name)}: +{introduced.Count} new, -{resolved} resolved:");
+                sb.AppendLine($"{name}: +{introduced.Count} new, -{resolved} resolved:");
                 foreach (var diagnostic in introduced.Take(30))
                     sb.AppendLine("  " + RenderDiagnostic(diagnostic, workspace));
                 if (introduced.Count > 30)
@@ -626,7 +667,7 @@ public static class AnalysisTools
             }
             else if (resolved > 0)
             {
-                sb.AppendLine($"{StripTfm(project.Name)}: no new problems, -{resolved} resolved.");
+                sb.AppendLine($"{name}: no new problems, -{resolved} resolved.");
             }
         }
 

@@ -62,7 +62,7 @@ On startup the server auto-discovers the solution at/above the working directory
 
 ## What it deliberately does NOT do
 
-- **No editing, no refactoring, no shell** — read-only by construction; your agent's own tools do the writing.
+- **No editing, no refactoring, no shell** — read-only by construction; your agent's own tools do the writing. (One documented exception to *code execution*: `get_diagnostics` with `include_analyzers=true` runs the project's third-party Roslyn analyzer assemblies in-process. It is off by default and stays opt-in; MCPRoslyn itself still never writes to your files.)
 - **No file reading/grep duplicates** — your agent already has better ones; MCPRoslyn only adds what grep can't do.
 - **No embeddings/semantic search** — evidence for code is mixed; exact symbol search + your agent's grep covers most of it.
 - **Reflection/DI-container/dynamic dispatch resolution** — impossible statically; tools state this caveat instead of guessing.
@@ -71,8 +71,8 @@ On startup the server auto-discovers the solution at/above the working directory
 ## Architecture notes
 
 - `MSBuildWorkspace` with out-of-process build hosts (Roslyn 5.6): `dotnet` on PATH loads SDK-style projects, an installed VS/Build Tools MSBuild loads legacy `.csproj`. `Microsoft.Build.Locator` is not used.
-- The workspace is an immutable snapshot; a `FileSystemWatcher` feeds edits through `Solution.WithDocumentText` lazily before each query — one file re-parse, downstream-only recompilation.
-- Multi-targeted projects load once per TFM; results are deduplicated by file+span.
+- The workspace is an immutable snapshot; a `FileSystemWatcher` feeds edits through `Solution.WithDocumentText` lazily before each query — one file re-parse, downstream-only recompilation. Watch roots cover every loaded document's directory, so linked/shared files declared outside a project folder stay in sync.
+- Multi-targeted projects appear once per TFM; `find_*`/`search` results are deduplicated by physical declaration identity (so distinct projects that share a fully-qualified name are *not* collapsed), and `get_diagnostics`/`analyze_impact` compile **every** target framework so a TFM-specific break is not missed.
 - Reference-assembly decompilation transparently falls back to the runtime implementation assembly (`System.Private.CoreLib` etc.) so BCL bodies are real, not `throw null` stubs.
 
 ## License

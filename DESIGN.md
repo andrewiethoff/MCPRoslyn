@@ -56,7 +56,8 @@ Key implementation facts (verified against Roslyn 5.6):
 - MSBuildWorkspace runs MSBuild **out-of-process** (BuildHost): .NET Core host for SDK-style projects (needs `dotnet` on PATH), net472 host for legacy .NET Framework projects (needs VS or Build Tools; Windows). `Microsoft.Build.Locator` is not needed and not referenced.
 - MSBuildWorkspace **never restores NuGet**. `load_solution` detects missing `project.assets.json` and tells the agent to run `dotnet restore`.
 - Load failures are silent unless `WorkspaceFailed` is hooked — we collect all workspace diagnostics and expose them in `workspace_status`.
-- Multi-targeted projects appear once per TFM; results are deduplicated by file path + span, and project names shown as `Name (net8.0)`.
+- Multi-targeted projects appear once per TFM. `find_*`/`search` dedupe by physical declaration identity (declaration file+span for source, assembly identity + doc-id for metadata) so genuine duplicates (a symbol seen once per TFM) collapse while two projects that share an FQN stay distinct and resolve to a teaching ambiguity error. `get_diagnostics`/`analyze_impact` compile **every** TFM flavor and dedupe diagnostics by id+path+message (line-insensitive, so a benign line shift is not a false break). Project names shown as `Name (net8.0)`.
+- `include_analyzers=true` (opt-in, off by default) executes the project's third-party analyzer assemblies in-process — the one path that runs untrusted code and is therefore documented as outside the read-only guarantee. MCPRoslyn itself still never writes to analyzed files.
 - The `Solution` model is immutable snapshots; incremental sync = `WithDocumentText`, which reparses one file and invalidates only downstream compilations.
 - Symbol identity across calls: `GetDocumentationCommentId` / `DocumentationCommentId.GetFirstSymbolForDeclarationId`.
 - `SymbolEqualityComparer.Default` everywhere; never `==` across compilations.
