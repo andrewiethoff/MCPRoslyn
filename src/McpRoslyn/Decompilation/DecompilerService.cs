@@ -14,13 +14,24 @@ namespace McpRoslyn.Decompilation;
 /// <summary>
 /// Metadata-as-source: decompiles NuGet/BCL symbols with ICSharpCode.Decompiler. Reference
 /// assemblies (empty bodies) are transparently swapped for the runtime implementation assembly
-/// when one can be located.
+/// when one can be located. CSharpDecompiler is not thread-safe, so cached instances are used
+/// single-flight per assembly; the cache is freshness-checked (rebuilt DLLs are re-read), bounded,
+/// and cleared on solution (re)load.
 /// </summary>
 public sealed class DecompilerService(ILogger<DecompilerService> log)
 {
     private const int MaxOutputChars = 40_000;
+    private const int MaxCachedDecompilers = 16;
 
-    private readonly ConcurrentDictionary<string, CSharpDecompiler> _decompilers = new(StringComparer.OrdinalIgnoreCase);
+    private sealed record CacheEntry(CSharpDecompiler Decompiler, DateTime LastWriteUtc, long Length)
+    {
+        public object Gate { get; } = new();
+    }
+
+    private readonly ConcurrentDictionary<string, CacheEntry> _decompilers = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Drops all cached decompilers (called when a solution is (re)loaded).</summary>
+    public void Clear() => _decompilers.Clear();
 
     public async Task<string> DecompileAsync(ResolvedSymbol resolved, CancellationToken ct)
     {
@@ -50,17 +61,32 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
             ct.ThrowIfCancellationRequested();
             try
             {
-                var decompiler = _decompilers.GetOrAdd(candidate, CreateDecompiler);
-                var typeDefinition = decompiler.TypeSystem.FindType(new FullTypeName(reflectionName)).GetDefinition();
-                if (typeDefinition is null
-                    || !string.Equals(typeDefinition.ParentModule?.MetadataFile?.FileName, candidate, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue; // Type not defined in this module (facade/forwarder) — try the next candidate.
-                }
+                var entry = GetEntry(candidate);
+                string code;
 
-                var code = symbol is INamedTypeSymbol
-                    ? decompiler.DecompileTypeAsString(new FullTypeName(reflectionName))
-                    : DecompileMembers(decompiler, typeDefinition, symbol);
+                // CSharpDecompiler instances are not thread-safe: single-flight per assembly.
+                lock (entry.Gate)
+                {
+                    var decompiler = entry.Decompiler;
+                    decompiler.CancellationToken = ct;
+                    try
+                    {
+                        var typeDefinition = decompiler.TypeSystem.FindType(new FullTypeName(reflectionName)).GetDefinition();
+                        if (typeDefinition is null
+                            || !string.Equals(typeDefinition.ParentModule?.MetadataFile?.FileName, candidate, StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue; // Type not defined in this module (facade/forwarder) — next candidate.
+                        }
+
+                        code = symbol is INamedTypeSymbol
+                            ? decompiler.DecompileTypeAsString(new FullTypeName(reflectionName))
+                            : DecompileMembers(decompiler, typeDefinition, symbol);
+                    }
+                    finally
+                    {
+                        decompiler.CancellationToken = CancellationToken.None;
+                    }
+                }
 
                 if (code.Length > MaxOutputChars)
                     code = code[..MaxOutputChars] + $"\n… truncated at {MaxOutputChars} chars.";
@@ -70,7 +96,15 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
                     header += "// NOTE: reference assembly — signatures are exact but method bodies are stubs.\n";
                 return header + code;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException and not ToolException)
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (ToolException)
+            {
+                throw;
+            }
+            catch (Exception ex)
             {
                 log.LogDebug(ex, "Decompilation from {Path} failed; trying next candidate", candidate);
             }
@@ -79,6 +113,28 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
         throw new ToolException(
             $"Could not decompile {SymbolFormat.FqnOf(symbol)} from [{assemblySymbol.Name}]. "
             + "The defining module may be unavailable on this machine.");
+    }
+
+    private CacheEntry GetEntry(string path)
+    {
+        var info = new FileInfo(path);
+        var lastWrite = info.LastWriteTimeUtc;
+        var length = info.Length;
+
+        if (_decompilers.TryGetValue(path, out var existing)
+            && existing.LastWriteUtc == lastWrite
+            && existing.Length == length)
+        {
+            return existing;
+        }
+
+        // Crude bound: agents revisit few assemblies; a full clear on overflow is fine.
+        if (_decompilers.Count >= MaxCachedDecompilers && !_decompilers.ContainsKey(path))
+            _decompilers.Clear();
+
+        var fresh = new CacheEntry(CreateDecompiler(path), lastWrite, length);
+        _decompilers[path] = fresh;
+        return fresh;
     }
 
     private static CSharpDecompiler CreateDecompiler(string path)
@@ -143,10 +199,6 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
                 var coreLib = Path.Combine(runtimeDir, "System.Private.CoreLib.dll");
                 if (File.Exists(coreLib))
                     yield return coreLib;
-
-                // Many facade types live in System.Private.Xml, System.Linq, etc. — try all runtime
-                // assemblies whose simple name is a prefix match as a last resort? Too broad; the
-                // two candidates above cover the overwhelmingly common cases.
             }
         }
 

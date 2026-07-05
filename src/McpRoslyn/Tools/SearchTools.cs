@@ -25,7 +25,9 @@ public static class SearchTools
         string? kind = null,
         [Description("Only symbols declared in projects whose name contains this.")]
         string? project = null,
+        [Description("Page size, 1-200 (default 50).")]
         int max_results = 50,
+        [Description("1-based page number.")]
         int page = 1)
         => ToolRunner.Run(loggerFactory.CreateLogger("mcp-roslyn"), "search_symbols", async () =>
         {
@@ -149,7 +151,9 @@ public static class SearchTools
         bool includeMembers, bool fullDocs, CancellationToken ct)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"{SymbolFormat.KindOf(symbol)} {SymbolFormat.SignatureOf(symbol)}");
+        // Types/namespaces already carry their keyword in the signature ("class Circle").
+        var kindPrefix = symbol is INamedTypeSymbol or INamespaceSymbol ? "" : SymbolFormat.KindOf(symbol) + " ";
+        sb.AppendLine($"{kindPrefix}{SymbolFormat.SignatureOf(symbol)}");
         sb.AppendLine($"fqn: {SymbolFormat.FqnOf(symbol)}");
         if (symbol.GetDocumentationCommentId() is { } docId)
             sb.AppendLine($"id: {docId}");
@@ -224,7 +228,7 @@ public static class SearchTools
             .ToList();
 
         const int cap = 60;
-        sb.AppendLine($"members ({members.Count}{(members.Count > cap ? $", showing {cap} — use search_symbols to find the rest" : "")}):");
+        sb.AppendLine($"members ({members.Count}{(members.Count > cap ? $", showing {cap} — use get_file_outline on the declaring file for the full list" : "")}):");
         foreach (var member in members.Take(cap))
         {
             var line = member.Locations.FirstOrDefault(l => l.IsInSource) is { } loc
@@ -273,11 +277,17 @@ public static class SearchTools
                 entries.Add((declared, lineSpan.StartLinePosition.Line + 1, lineSpan.EndLinePosition.Line + 1));
             }
 
+            // Generated files (designers, protobuf) can declare thousands of members; cap so the
+            // outline never blows the client's response limit.
+            const int cap = 400;
             var sb = new StringBuilder();
             sb.AppendLine($"{workspace.RelPath(document.FilePath)} — {text.Lines.Count} lines, {document.Project.Language}"
-                          + $" (project {document.Project.Name})");
+                          + $" (project {document.Project.Name}), {entries.Count} declaration(s)"
+                          + (entries.Count > cap
+                              ? $", showing first {cap} (likely generated — use search_symbols or get_symbol instead)"
+                              : ""));
 
-            foreach (var (declared, startLine, endLine) in entries.OrderBy(e => e.StartLine))
+            foreach (var (declared, startLine, endLine) in entries.OrderBy(e => e.StartLine).Take(cap))
             {
                 var depth = ContainmentDepth(declared);
                 var range = startLine == endLine ? $"[{startLine}]" : $"[{startLine}-{endLine}]";

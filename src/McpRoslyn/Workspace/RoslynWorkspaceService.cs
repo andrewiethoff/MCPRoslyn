@@ -25,13 +25,17 @@ public sealed record WorkspaceStatusInfo(
     string? LoadError,
     IReadOnlyList<string> LoadDiagnostics,
     IReadOnlyList<string> ChangedProjectFiles,
-    int PendingFileChanges);
+    int PendingFileChanges,
+    string? ReloadInFlightTarget,
+    int UnwatchedRoots,
+    IReadOnlyList<string> UnreadableFiles);
 
 /// <summary>
 /// Owns the MSBuildWorkspace lifecycle and an immutable <see cref="Solution"/> snapshot that is
 /// kept in sync with the file system: .cs/.vb edits are applied via WithDocumentText before every
 /// query; project-file changes flag the workspace stale (a full reload is needed for those).
-/// Strictly read-only: no API here ever writes to an analyzed file.
+/// A reload keeps serving the previous snapshot until the new one is ready, and a failed reload
+/// never destroys a working workspace. Strictly read-only: nothing here writes to analyzed files.
 /// </summary>
 public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) : IDisposable
 {
@@ -40,9 +44,15 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
     private static readonly string[] SourceExtensions = [".cs", ".vb"];
     private static readonly string[] BuildFileExtensions = [".csproj", ".vbproj", ".props", ".targets", ".sln", ".slnx"];
 
+    private const int MaxWatcherRoots = 10;
+    private const int MaxReadAttemptsPerRound = 3;
+    private const int MaxReadRounds = 3;
+
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly ConcurrentQueue<(string Path, WatcherChangeTypes Kind)> _pendingFiles = new();
     private readonly ConcurrentDictionary<string, byte> _changedProjectFiles = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int> _readFailureRounds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _unreadableFiles = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<FileSystemWatcher> _watchers = [];
     private readonly List<string> _loadDiagnostics = [];
 
@@ -52,11 +62,15 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
     private volatile WorkspaceState _state = WorkspaceState.NotLoaded;
     private string? _loadError;
     private string? _solutionPath;
+    private string? _activeLoadTarget;
     private DateTime? _loadedAtUtc;
     private TimeSpan? _loadDuration;
+    private DateTime _lastSyncUtc = DateTime.UtcNow;
     private int _projectsLoaded;
     private string? _currentLoadingProject;
-    private volatile bool _watcherOverflow;
+    private volatile bool _resyncNeeded;
+    private volatile bool _disposed;
+    private int _unwatchedRoots;
 
     public WorkspaceState State => _state;
 
@@ -138,19 +152,32 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
     /// <summary>Loads (or reloads) a solution/project. Serialized; only one load at a time.</summary>
     public async Task<string> LoadAsync(string? path, bool force, Action<string>? progress, CancellationToken ct)
     {
+        if (_disposed)
+            throw new ToolException("Server is shutting down.");
+
         var target = ResolveLoadTarget(path);
 
         if (!force
             && _state == WorkspaceState.Loaded
+            && _activeLoadTarget is null
             && string.Equals(_solutionPath, target, StringComparison.OrdinalIgnoreCase))
         {
             return $"Already loaded: {target}. Pass force_reload=true to reload.";
         }
 
+        // A load of the same target is already running: report instead of blocking on the gate
+        // for its whole duration with zero progress notifications.
+        if (!force
+            && string.Equals(_activeLoadTarget, target, StringComparison.OrdinalIgnoreCase))
+        {
+            return $"Load already in progress for {target} — {_projectsLoaded} project(s) resolved so far"
+                   + (_currentLoadingProject is null ? "" : $", currently {_currentLoadingProject}")
+                   + ". Check workspace_status or retry shortly.";
+        }
+
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            // Re-check under the gate (another caller may have just finished the same load).
             if (!force
                 && _state == WorkspaceState.Loaded
                 && string.Equals(_solutionPath, target, StringComparison.OrdinalIgnoreCase))
@@ -160,20 +187,19 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
 
             var task = LoadCoreAsync(target, progress, ct);
             _loadTask = task;
-            await task.ConfigureAwait(false);
+            return await task.ConfigureAwait(false);
         }
         finally
         {
-            _gate.Release();
+            try
+            {
+                _gate.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Host shut down while we held the gate.
+            }
         }
-
-        var status = GetStatus();
-        var diagNote = status.LoadDiagnostics.Count > 0
-            ? $" {status.LoadDiagnostics.Count} workspace warning(s) — see workspace_status."
-            : "";
-        var restoreNote = DetectRestoreProblem() ? " Some projects have no metadata references — run 'dotnet restore' on the solution and reload." : "";
-        var projects = _solution!.Projects.ToList();
-        return $"Loaded {target}: {projects.Count} project(s) in {_loadDuration!.Value.TotalSeconds:F1}s.{diagNote}{restoreNote}";
     }
 
     private string ResolveLoadTarget(string? path)
@@ -215,30 +241,38 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
         return full;
     }
 
-    private async Task LoadCoreAsync(string target, Action<string>? progress, CancellationToken ct)
+    private async Task<string> LoadCoreAsync(string target, Action<string>? progress, CancellationToken ct)
     {
-        DisposeWorkspace();
-        _state = WorkspaceState.Loading;
-        _loadError = null;
-        _solutionPath = target;
+        _activeLoadTarget = target;
         _projectsLoaded = 0;
         _currentLoadingProject = null;
-        lock (_loadDiagnostics)
-            _loadDiagnostics.Clear();
-        _changedProjectFiles.Clear();
-        while (_pendingFiles.TryDequeue(out _)) { }
+        var hadSolution = _solution is not null;
+        if (!hadSolution)
+            _state = WorkspaceState.Loading;
+
+        // Project-file changes recorded before this load are covered by the fresh load itself;
+        // anything arriving DURING the load must survive it.
+        var preExistingProjectChanges = _changedProjectFiles.Keys.ToList();
+
+        // Watch the target's directory during the load so edits made while loading are queued and
+        // reconciled by the normal sync path afterwards (no dead zone). The old watchers keep
+        // running for the old snapshot until the swap.
+        var provisionalWatchers = new List<FileSystemWatcher>();
+        TryAddWatcher(provisionalWatchers, Path.GetDirectoryName(Path.GetFullPath(target))!);
 
         var started = DateTime.UtcNow;
+        MSBuildWorkspace? newWorkspace = null;
+        var newDiagnostics = new List<string>();
+
         try
         {
-            var workspace = MSBuildWorkspace.Create();
-            _workspace = workspace;
-            workspace.RegisterWorkspaceFailedHandler(e =>
+            newWorkspace = MSBuildWorkspace.Create();
+            newWorkspace.RegisterWorkspaceFailedHandler(e =>
             {
-                lock (_loadDiagnostics)
+                lock (newDiagnostics)
                 {
-                    if (_loadDiagnostics.Count < 500)
-                        _loadDiagnostics.Add($"{e.Diagnostic.Kind}: {e.Diagnostic.Message}");
+                    if (newDiagnostics.Count < 500)
+                        newDiagnostics.Add($"{e.Diagnostic.Kind}: {e.Diagnostic.Message}");
                 }
             });
 
@@ -247,62 +281,112 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
                 var name = Path.GetFileNameWithoutExtension(p.FilePath);
                 _currentLoadingProject = name;
                 if (p.Operation == ProjectLoadOperation.Resolve)
-                {
                     Interlocked.Increment(ref _projectsLoaded);
-                    progress?.Invoke($"{name}{(p.TargetFramework is null ? "" : $" ({p.TargetFramework})")}");
-                }
+                progress?.Invoke($"{name} — {p.Operation}{(p.TargetFramework is null ? "" : $" ({p.TargetFramework})")}");
             });
 
             Solution solution;
             var ext = Path.GetExtension(target);
             if (SolutionExtensions.Contains(ext, StringComparer.OrdinalIgnoreCase))
             {
-                solution = await workspace.OpenSolutionAsync(target, loadProgress, ct).ConfigureAwait(false);
+                solution = await newWorkspace.OpenSolutionAsync(target, loadProgress, ct).ConfigureAwait(false);
             }
             else
             {
-                var project = await workspace.OpenProjectAsync(target, loadProgress, ct).ConfigureAwait(false);
+                var project = await newWorkspace.OpenProjectAsync(target, loadProgress, ct).ConfigureAwait(false);
                 solution = project.Solution;
             }
 
+            // Success — swap. Assign the new snapshot before disposing the old workspace so
+            // concurrent readers never observe null.
+            var oldWorkspace = _workspace;
             _solution = solution;
+            _workspace = newWorkspace;
+            newWorkspace = null; // ownership transferred
+            _solutionPath = target;
             _loadedAtUtc = DateTime.UtcNow;
             _loadDuration = DateTime.UtcNow - started;
+            _lastSyncUtc = started;
+            _loadError = null;
             _state = WorkspaceState.Loaded;
+
+            lock (_loadDiagnostics)
+            {
+                _loadDiagnostics.Clear();
+                _loadDiagnostics.AddRange(newDiagnostics);
+            }
+
+            foreach (var key in preExistingProjectChanges)
+                _changedProjectFiles.TryRemove(key, out _);
+            _readFailureRounds.Clear();
+            _unreadableFiles.Clear();
+
             SetUpWatchers(solution);
+            oldWorkspace?.Dispose();
+
             log.LogInformation("Loaded {Path}: {Count} projects in {Secs:F1}s",
                 target, solution.ProjectIds.Count, _loadDuration.Value.TotalSeconds);
+
+            var projectCount = solution.Projects
+                .GroupBy(p => p.FilePath ?? p.Name, StringComparer.OrdinalIgnoreCase)
+                .Count();
+            var diagNote = newDiagnostics.Count > 0
+                ? $" {newDiagnostics.Count} workspace warning(s) — see workspace_status."
+                : "";
+            var restoreNote = solution.Projects.Any(p => !p.MetadataReferences.Any() && p.DocumentIds.Count > 0)
+                ? " Some projects have no metadata references — run 'dotnet restore' on the solution and reload."
+                : "";
+            return $"Loaded {target}: {projectCount} project(s) in {_loadDuration.Value.TotalSeconds:F1}s.{diagNote}{restoreNote}";
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            newWorkspace?.Dispose();
+            log.LogError(ex, "Failed to load {Path}", target);
+
+            if (hadSolution)
+            {
+                // Keep serving the previous, still-valid snapshot.
+                _state = WorkspaceState.Loaded;
+                throw new ToolException(
+                    $"Failed to load {target}: {ex.Message}. The previously loaded solution ({_solutionPath}) remains active.");
+            }
+
             _state = WorkspaceState.Failed;
             _loadError = ex.Message;
-            log.LogError(ex, "Failed to load {Path}", target);
             throw new ToolException($"Failed to load {target}: {ex.Message}");
         }
-    }
-
-    private bool DetectRestoreProblem()
-    {
-        var solution = _solution;
-        if (solution is null)
-            return false;
-        return solution.Projects.Any(p => !p.MetadataReferences.Any() && p.DocumentIds.Count > 0);
+        finally
+        {
+            _activeLoadTarget = null;
+            _currentLoadingProject = null;
+            foreach (var watcher in provisionalWatchers)
+            {
+                try
+                {
+                    watcher.Dispose();
+                }
+                catch
+                {
+                    // Best-effort.
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------- querying
 
     /// <summary>
     /// Returns the current solution snapshot with all pending file edits applied.
-    /// Waits a bounded time if a load is in flight; throws a teaching error otherwise.
+    /// Waits a bounded time if the initial load is in flight; a reload in flight keeps serving
+    /// the previous snapshot.
     /// </summary>
     public async Task<Solution> GetSolutionAsync(CancellationToken ct, TimeSpan? maxWait = null)
     {
         var wait = maxWait ?? TimeSpan.FromSeconds(25);
 
-        if (_state == WorkspaceState.NotLoaded)
+        if (_state == WorkspaceState.NotLoaded && _activeLoadTarget is null)
         {
-            // Try a lazy auto-load if discovery is unambiguous (startup may have been skipped/raced).
+            // Lazy auto-load if discovery is unambiguous (startup may have been skipped/raced).
             var candidates = DiscoverCandidates(StartDirectory);
             if (candidates.Count == 1)
                 _ = Task.Run(() => LoadAsync(candidates[0], force: false, progress: null, CancellationToken.None), CancellationToken.None);
@@ -361,19 +445,36 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
             _loadError,
             diags,
             [.. _changedProjectFiles.Keys],
-            _pendingFiles.Count);
+            _pendingFiles.Count,
+            _activeLoadTarget,
+            _unwatchedRoots,
+            [.. _unreadableFiles.Keys]);
     }
 
     /// <summary>
-    /// One-line staleness warning tools append to their output when project files changed after
-    /// load (those changes cannot be applied incrementally), or null when fresh.
+    /// One-line staleness warning tools append to their output, or null when fresh.
     /// </summary>
-    public string? StaleNotice =>
-        _watcherOverflow
-            ? "⚠ file-watcher overflow — results may be stale; call load_solution with force_reload=true."
-            : !_changedProjectFiles.IsEmpty
-                ? $"⚠ {_changedProjectFiles.Count} project file(s) changed since load (e.g. {Path.GetFileName(_changedProjectFiles.Keys.First())}) — results may be stale; call load_solution with force_reload=true."
-                : null;
+    public string? StaleNotice
+    {
+        get
+        {
+            if (_activeLoadTarget is { } reloading && _solution is not null)
+                return $"⚠ a (re)load of {Path.GetFileName(reloading)} is in progress — results reflect the previous snapshot.";
+
+            var changedProject = _changedProjectFiles.Keys.FirstOrDefault();
+            if (changedProject is not null)
+                return $"⚠ {_changedProjectFiles.Count} project file(s) changed since load (e.g. {Path.GetFileName(changedProject)}) — results may be stale; call load_solution with force_reload=true.";
+
+            var unreadable = _unreadableFiles.Keys.FirstOrDefault();
+            if (unreadable is not null)
+                return $"⚠ {_unreadableFiles.Count} changed file(s) could not be re-read (e.g. {Path.GetFileName(unreadable)}) — results for them may be stale.";
+
+            if (_unwatchedRoots > 0)
+                return $"⚠ {_unwatchedRoots} project director{(_unwatchedRoots == 1 ? "y is" : "ies are")} not file-watched — edits there are invisible until load_solution(force_reload:true).";
+
+            return null;
+        }
+    }
 
     public string RelPath(string? absolutePath)
     {
@@ -391,7 +492,8 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
     private void SetUpWatchers(Solution solution)
     {
         ClearWatchers();
-        _watcherOverflow = false;
+        _resyncNeeded = false;
+        Interlocked.Exchange(ref _unwatchedRoots, 0);
 
         var roots = new List<string>();
         var solutionDir = SolutionDirectory;
@@ -407,7 +509,7 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
                 roots.Add(dir);
         }
 
-        // Reduce to a minimal, capped set of roots.
+        // Reduce to a minimal set of roots.
         roots = roots
             .OrderBy(r => r.Length)
             .Aggregate(new List<string>(), (acc, r) =>
@@ -417,32 +519,46 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
                 return acc;
             });
 
-        foreach (var root in roots.Take(10))
+        if (roots.Count > MaxWatcherRoots)
+            Interlocked.Add(ref _unwatchedRoots, roots.Count - MaxWatcherRoots);
+
+        lock (_watchers)
         {
-            try
+            foreach (var root in roots.Take(MaxWatcherRoots))
             {
-                var watcher = new FileSystemWatcher(root)
-                {
-                    IncludeSubdirectories = true,
-                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.DirectoryName,
-                    InternalBufferSize = 64 * 1024,
-                };
-                watcher.Changed += (_, e) => OnFsEvent(e.FullPath, WatcherChangeTypes.Changed);
-                watcher.Created += (_, e) => OnFsEvent(e.FullPath, WatcherChangeTypes.Created);
-                watcher.Deleted += (_, e) => OnFsEvent(e.FullPath, WatcherChangeTypes.Deleted);
-                watcher.Renamed += (_, e) =>
-                {
-                    OnFsEvent(e.OldFullPath, WatcherChangeTypes.Deleted);
-                    OnFsEvent(e.FullPath, WatcherChangeTypes.Created);
-                };
-                watcher.Error += (_, _) => _watcherOverflow = true;
-                watcher.EnableRaisingEvents = true;
-                _watchers.Add(watcher);
+                if (!TryAddWatcher(_watchers, root))
+                    Interlocked.Increment(ref _unwatchedRoots);
             }
-            catch (Exception ex)
+        }
+    }
+
+    private bool TryAddWatcher(List<FileSystemWatcher> target, string root)
+    {
+        try
+        {
+            var watcher = new FileSystemWatcher(root)
             {
-                log.LogWarning(ex, "Could not watch {Root}; incremental sync limited", root);
-            }
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.DirectoryName,
+                InternalBufferSize = 64 * 1024,
+            };
+            watcher.Changed += (_, e) => OnFsEvent(e.FullPath, WatcherChangeTypes.Changed);
+            watcher.Created += (_, e) => OnFsEvent(e.FullPath, WatcherChangeTypes.Created);
+            watcher.Deleted += (_, e) => OnFsEvent(e.FullPath, WatcherChangeTypes.Deleted);
+            watcher.Renamed += (_, e) =>
+            {
+                OnFsEvent(e.OldFullPath, WatcherChangeTypes.Deleted);
+                OnFsEvent(e.FullPath, WatcherChangeTypes.Created);
+            };
+            watcher.Error += (_, _) => _resyncNeeded = true;
+            watcher.EnableRaisingEvents = true;
+            target.Add(watcher);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "Could not watch {Root}; incremental sync limited", root);
+            return false;
         }
     }
 
@@ -479,13 +595,36 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
 
     private async Task<Solution> ApplyPendingChangesAsync(CancellationToken ct)
     {
-        if (_pendingFiles.IsEmpty)
+        if (_pendingFiles.IsEmpty && !_resyncNeeded)
             return _solution ?? throw new ToolException("No solution loaded. Call load_solution first.");
 
-        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        // Bounded: if a (re)load holds the gate for minutes, serve the previous snapshot instead
+        // of hanging past the client timeout. StaleNotice reports the reload separately.
+        if (!await _gate.WaitAsync(TimeSpan.FromSeconds(15), ct).ConfigureAwait(false))
+        {
+            return _solution ?? throw new ToolException(
+                "Solution is (re)loading and the previous snapshot is not available yet. Retry in a moment, or check workspace_status.");
+        }
+
         try
         {
             var solution = _solution ?? throw new ToolException("No solution loaded. Call load_solution first.");
+
+            if (_resyncNeeded)
+            {
+                // The watcher overflowed or errored: re-arm it and reconcile by timestamp so we
+                // never trust a lossy event stream.
+                SetUpWatchers(solution);
+                foreach (var document in solution.Projects.SelectMany(p => p.Documents))
+                {
+                    if (document.FilePath is not { } filePath)
+                        continue;
+                    if (!File.Exists(filePath))
+                        _pendingFiles.Enqueue((filePath, WatcherChangeTypes.Deleted));
+                    else if (File.GetLastWriteTimeUtc(filePath) > _lastSyncUtc)
+                        _pendingFiles.Enqueue((filePath, WatcherChangeTypes.Changed));
+                }
+            }
 
             // Coalesce: last event per path wins (a Created followed by Changed is just an upsert).
             var changes = new Dictionary<string, WatcherChangeTypes>(StringComparer.OrdinalIgnoreCase);
@@ -498,82 +637,113 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
                         : change.Kind;
             }
 
-            foreach (var (path, kind) in changes)
+            try
             {
-                ct.ThrowIfCancellationRequested();
-                var docIds = solution.GetDocumentIdsWithFilePath(path);
-
-                if (kind == WatcherChangeTypes.Deleted || !File.Exists(path))
+                foreach (var (path, kind) in changes)
                 {
-                    foreach (var id in docIds)
-                        solution = solution.RemoveDocument(id);
-                    continue;
-                }
+                    ct.ThrowIfCancellationRequested();
+                    var docIds = solution.GetDocumentIdsWithFilePath(path);
 
-                var text = TryReadFile(path);
-                if (text is null)
-                {
-                    // Unreadable right now (editor lock etc.) — requeue for the next query.
-                    _pendingFiles.Enqueue((path, kind));
-                    continue;
-                }
-
-                if (docIds.Length > 0)
-                {
-                    foreach (var id in docIds)
-                        solution = solution.WithDocumentText(id, text, PreservationMode.PreserveValue);
-                }
-                else
-                {
-                    // New file: attach to every project (all TFM flavors) whose directory contains it
-                    // and whose language matches. SDK-style projects glob sources, so this mirrors
-                    // what a real reload would produce.
-                    var language = Path.GetExtension(path).Equals(".vb", StringComparison.OrdinalIgnoreCase)
-                        ? LanguageNames.VisualBasic
-                        : LanguageNames.CSharp;
-
-                    var owners = solution.Projects
-                        .Where(p => p.Language == language && p.FilePath is not null
-                                    && IsUnder(path, Path.GetDirectoryName(p.FilePath)!))
-                        .GroupBy(p => Path.GetDirectoryName(p.FilePath)!, StringComparer.OrdinalIgnoreCase)
-                        .OrderByDescending(g => g.Key.Length)
-                        .FirstOrDefault();
-
-                    if (owners is not null)
+                    if (kind == WatcherChangeTypes.Deleted || !File.Exists(path))
                     {
-                        foreach (var project in owners)
+                        foreach (var id in docIds)
+                            solution = solution.RemoveDocument(id);
+                        _readFailureRounds.TryRemove(path, out _);
+                        continue;
+                    }
+
+                    var text = await TryReadFileAsync(path, ct).ConfigureAwait(false);
+                    if (text is null)
+                    {
+                        // Unreadable right now (editor lock etc.): retry on the next few queries,
+                        // then give up loudly via StaleNotice instead of paying the retry forever.
+                        var rounds = _readFailureRounds.AddOrUpdate(path, 1, (_, r) => r + 1);
+                        if (rounds < MaxReadRounds)
+                            _pendingFiles.Enqueue((path, kind));
+                        else
+                            _unreadableFiles.TryAdd(path, 0);
+                        continue;
+                    }
+
+                    _readFailureRounds.TryRemove(path, out _);
+                    _unreadableFiles.TryRemove(path, out _);
+
+                    if (docIds.Length > 0)
+                    {
+                        foreach (var id in docIds)
+                            solution = solution.WithDocumentText(id, text, PreservationMode.PreserveValue);
+                    }
+                    else
+                    {
+                        // New file: attach to every project (all TFM flavors) whose directory
+                        // contains it and whose language matches — mirroring SDK-style globbing.
+                        var language = Path.GetExtension(path).Equals(".vb", StringComparison.OrdinalIgnoreCase)
+                            ? LanguageNames.VisualBasic
+                            : LanguageNames.CSharp;
+
+                        var owners = solution.Projects
+                            .Where(p => p.Language == language && p.FilePath is not null
+                                        && IsUnder(path, Path.GetDirectoryName(p.FilePath)!))
+                            .GroupBy(p => Path.GetDirectoryName(p.FilePath)!, StringComparer.OrdinalIgnoreCase)
+                            .OrderByDescending(g => g.Key.Length)
+                            .FirstOrDefault();
+
+                        if (owners is not null)
                         {
-                            solution = solution.AddDocument(
-                                DocumentId.CreateNewId(project.Id),
-                                Path.GetFileName(path),
-                                text,
-                                filePath: path);
+                            foreach (var project in owners)
+                            {
+                                solution = solution.AddDocument(
+                                    DocumentId.CreateNewId(project.Id),
+                                    Path.GetFileName(path),
+                                    text,
+                                    filePath: path);
+                            }
                         }
                     }
                 }
             }
+            catch
+            {
+                // Never lose edits: put everything back for the next query. Re-applying entries
+                // that already made it into the local snapshot is harmless (contents are re-read).
+                foreach (var (path, kind) in changes)
+                    _pendingFiles.Enqueue((path, kind));
+                throw;
+            }
 
             _solution = solution;
+            _lastSyncUtc = DateTime.UtcNow;
             return solution;
         }
         finally
         {
-            _gate.Release();
+            try
+            {
+                _gate.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
     }
 
-    private static SourceText? TryReadFile(string path)
+    private static async Task<SourceText?> TryReadFileAsync(string path, CancellationToken ct)
     {
-        for (var attempt = 0; attempt < 3; attempt++)
+        for (var attempt = 1; attempt <= MaxReadAttemptsPerRound; attempt++)
         {
             try
             {
-                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                await using var stream = new FileStream(
+                    path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 return SourceText.From(stream);
+            }
+            catch (IOException) when (attempt < MaxReadAttemptsPerRound)
+            {
+                await Task.Delay(50, ct).ConfigureAwait(false);
             }
             catch (IOException)
             {
-                Thread.Sleep(50);
+                return null;
             }
             catch (UnauthorizedAccessException)
             {
@@ -593,32 +763,31 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
 
     private void ClearWatchers()
     {
-        foreach (var watcher in _watchers)
+        lock (_watchers)
         {
-            try
+            foreach (var watcher in _watchers)
             {
-                watcher.EnableRaisingEvents = false;
-                watcher.Dispose();
+                try
+                {
+                    watcher.EnableRaisingEvents = false;
+                    watcher.Dispose();
+                }
+                catch
+                {
+                    // Disposal is best-effort.
+                }
             }
-            catch
-            {
-                // Disposal is best-effort.
-            }
+            _watchers.Clear();
         }
-        _watchers.Clear();
-    }
-
-    private void DisposeWorkspace()
-    {
-        ClearWatchers();
-        _workspace?.Dispose();
-        _workspace = null;
-        _solution = null;
     }
 
     public void Dispose()
     {
-        DisposeWorkspace();
+        _disposed = true;
+        ClearWatchers();
+        _workspace?.Dispose();
+        _workspace = null;
+        _solution = null;
         _gate.Dispose();
     }
 }

@@ -15,6 +15,7 @@ public static class WorkspaceTools
     [Description("Load (or switch to / reload) a .sln, .slnx, .csproj or .vbproj. Without a path, auto-discovers from the working directory. Loading a large solution can take a while; progress is reported. NuGet restore is NOT performed — run 'dotnet restore' first if the solution hasn't been built on this machine.")]
     public static Task<string> LoadSolution(
         RoslynWorkspaceService workspace,
+        McpRoslyn.Decompilation.DecompilerService decompiler,
         ILoggerFactory loggerFactory,
         IProgress<ProgressNotificationValue> progress,
         CancellationToken ct,
@@ -24,12 +25,20 @@ public static class WorkspaceTools
         bool force_reload = false)
         => ToolRunner.Run(loggerFactory.CreateLogger("mcp-roslyn"), "load_solution", async () =>
         {
-            var count = 0f;
-            return await workspace.LoadAsync(
+            var count = 0;
+            var result = await workspace.LoadAsync(
                 path,
                 force_reload,
-                name => progress.Report(new ProgressNotificationValue { Progress = ++count, Message = name }),
+                // Progress<T> callbacks can run concurrently on the thread pool.
+                name => progress.Report(new ProgressNotificationValue
+                {
+                    Progress = Interlocked.Increment(ref count),
+                    Message = name,
+                }),
                 ct);
+            // Assemblies may have been rebuilt/replaced since the previous load.
+            decompiler.Clear();
+            return result;
         });
 
     [McpServerTool(Name = "workspace_status")]
@@ -77,12 +86,23 @@ public static class WorkspaceTools
                     break;
             }
 
+            if (status.ReloadInFlightTarget is not null)
+                sb.AppendLine($"reload in progress: {status.ReloadInFlightTarget} ({status.ProjectsLoadedSoFar} projects resolved"
+                              + (status.CurrentlyLoadingProject is null ? ")" : $", currently {status.CurrentlyLoadingProject})"));
+
             if (status.ChangedProjectFiles.Count > 0)
             {
                 sb.AppendLine($"stale: {status.ChangedProjectFiles.Count} project file(s) changed since load — call load_solution(force_reload:true):");
                 foreach (var file in status.ChangedProjectFiles.Take(10))
                     sb.AppendLine($"  {file}");
             }
+
+            if (status.UnreadableFiles.Count > 0)
+                sb.AppendLine($"unreadable: {status.UnreadableFiles.Count} changed file(s) could not be re-read (locked?): "
+                              + string.Join(", ", status.UnreadableFiles.Take(5)));
+
+            if (status.UnwatchedRoots > 0)
+                sb.AppendLine($"unwatched: {status.UnwatchedRoots} project director(ies) beyond the watcher cap — edits there are invisible until a forced reload.");
 
             if (status.LoadDiagnostics.Count > 0)
             {

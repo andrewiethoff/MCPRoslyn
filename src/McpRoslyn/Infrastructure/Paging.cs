@@ -34,7 +34,12 @@ public static class Paging
         var sb = new StringBuilder();
         sb.Append(items.Count).Append(' ').Append(label);
         if (items.Count > slice.Count)
-            sb.Append($" (showing {start + 1}–{start + slice.Count}; page={page + 1} for more)");
+        {
+            sb.Append($" (showing {start + 1}–{start + slice.Count}");
+            if (start + slice.Count < items.Count)
+                sb.Append($"; page={page + 1} for more");
+            sb.Append(')');
+        }
         sb.AppendLine(":");
 
         foreach (var item in slice)

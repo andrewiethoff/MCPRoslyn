@@ -29,7 +29,9 @@ public static class NavigationTools
         string? project = null,
         [Description("Include the source line of each reference (default true; false saves tokens).")]
         bool include_snippets = true,
+        [Description("Page size, 1-200 (default 50).")]
         int max_results = 50,
+        [Description("1-based page number.")]
         int page = 1)
         => ToolRunner.Run(loggerFactory.CreateLogger("mcp-roslyn"), "find_references", async () =>
         {
@@ -39,11 +41,11 @@ public static class NavigationTools
 
             var referencedSymbols = await SymbolFinder.FindReferencesAsync(target, solution, ct);
 
-            var classify = UsageClassifier.IsClassifiable(target);
+            // Pass 1 — dedupe, count and sort using only line spans (cheap); snippets and
+            // read/write classification are materialized for the rendered page only.
             var seen = new HashSet<string>();
-            var rows = new List<(string Path, int Line, string Text)>();
-            var fileCount = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var rootCache = new Dictionary<DocumentId, (SyntaxNode Root, Microsoft.CodeAnalysis.Text.SourceText Text)>();
+            var hits = new List<(string Path, int Line, ReferenceLocation Location)>();
+            var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var referenced in referencedSymbols)
             {
@@ -57,45 +59,70 @@ public static class NavigationTools
                         continue;
 
                     var lineSpan = location.Location.GetLineSpan();
-                    fileCount.Add(lineSpan.Path);
-
-                    if (!rootCache.TryGetValue(location.Document.Id, out var cached))
-                    {
-                        var root = await location.Document.GetSyntaxRootAsync(ct);
-                        var text = await location.Document.GetTextAsync(ct);
-                        if (root is null)
-                            continue;
-                        cached = (root, text);
-                        rootCache[location.Document.Id] = cached;
-                    }
-
-                    var flag = classify ? UsageClassifier.Classify(cached.Root, location.Location.SourceSpan) : "";
-                    var implicitTag = location.IsImplicit ? " (implicit)" : "";
-                    var snippet = include_snippets
-                        ? "  " + SymbolFormat.LineSnippet(cached.Text, location.Location.SourceSpan, 120)
-                        : "";
-
-                    rows.Add((lineSpan.Path, lineSpan.StartLinePosition.Line + 1,
-                        $"{workspace.RelPath(lineSpan.Path)}:{lineSpan.StartLinePosition.Line + 1}"
-                        + (flag.Length > 0 ? $" {flag}" : "") + implicitTag + snippet));
+                    files.Add(lineSpan.Path);
+                    hits.Add((lineSpan.Path, lineSpan.StartLinePosition.Line + 1, location));
                 }
             }
 
-            rows.Sort((a, b) =>
+            var fqn = SymbolFormat.FqnOf(target);
+            var definedFooter = "defined: " + string.Join(", ", SymbolFormat.DeclarationLocations(target, workspace.RelPath));
+            if (hits.Count == 0)
+            {
+                return ToolHelpers.WithStaleNotice(
+                    $"0 references to {fqn} found in the loaded solution "
+                    + "(reflection/DI/serialized usages are invisible to static analysis).\n" + definedFooter,
+                    workspace);
+            }
+
+            hits.Sort((a, b) =>
             {
                 var byPath = string.Compare(a.Path, b.Path, StringComparison.OrdinalIgnoreCase);
                 return byPath != 0 ? byPath : a.Line.CompareTo(b.Line);
             });
 
-            var header = $"reference(s) to {SymbolFormat.FqnOf(target)} in {fileCount.Count} file(s)";
-            var output = Paging.Render(
-                rows.Select(r => r.Text).ToList(), page, max_results, header,
-                line => line,
-                emptyMessage: $"0 references to {SymbolFormat.FqnOf(target)} found in the loaded solution "
-                              + "(reflection/DI/serialized usages are invisible to static analysis).",
-                footer: "defined: " + string.Join(", ", SymbolFormat.DeclarationLocations(target, workspace.RelPath)));
+            max_results = Math.Clamp(max_results <= 0 ? Paging.DefaultMax : max_results, 1, Paging.MaxAllowed);
+            page = Math.Max(1, page);
+            var start = (page - 1) * max_results;
+            if (start >= hits.Count)
+                return $"{hits.Count} reference(s), but page {page} is past the end.";
+            var slice = hits.Skip(start).Take(max_results).ToList();
 
-            return ToolHelpers.WithStaleNotice(output, workspace);
+            // Pass 2 — materialize only the rendered rows.
+            var classify = UsageClassifier.IsClassifiable(target);
+            var rootCache = new Dictionary<DocumentId, (SyntaxNode? Root, Microsoft.CodeAnalysis.Text.SourceText Text)>();
+            var sb = new StringBuilder();
+            sb.Append($"{hits.Count} reference(s) to {fqn} in {files.Count} file(s)");
+            if (hits.Count > slice.Count)
+            {
+                sb.Append($" (showing {start + 1}–{start + slice.Count}");
+                if (start + slice.Count < hits.Count)
+                    sb.Append($"; page={page + 1} for more");
+                sb.Append(')');
+            }
+            sb.AppendLine(":");
+
+            foreach (var (path, line, location) in slice)
+            {
+                if (!rootCache.TryGetValue(location.Document.Id, out var cached))
+                {
+                    cached = (await location.Document.GetSyntaxRootAsync(ct),
+                              await location.Document.GetTextAsync(ct));
+                    rootCache[location.Document.Id] = cached;
+                }
+
+                var flag = classify && cached.Root is not null
+                    ? UsageClassifier.Classify(cached.Root, location.Location.SourceSpan)
+                    : "";
+                var implicitTag = location.IsImplicit ? " (implicit)" : "";
+                var snippet = include_snippets
+                    ? "  " + SymbolFormat.LineSnippet(cached.Text, location.Location.SourceSpan, 120)
+                    : "";
+                sb.AppendLine($"{workspace.RelPath(path)}:{line}"
+                              + (flag.Length > 0 ? $" {flag}" : "") + implicitTag + snippet);
+            }
+
+            sb.AppendLine(definedFooter);
+            return ToolHelpers.WithStaleNotice(sb.ToString().TrimEnd(), workspace);
         });
 
     // ---------------------------------------------------------------- find_implementations
@@ -110,7 +137,9 @@ public static class NavigationTools
         string symbol,
         [Description("auto|implementations|overrides|derived (default auto).")]
         string kind = "auto",
+        [Description("Page size, 1-200 (default 50).")]
         int max_results = 50,
+        [Description("1-based page number.")]
         int page = 1)
         => ToolRunner.Run(loggerFactory.CreateLogger("mcp-roslyn"), "find_implementations", async () =>
         {
@@ -181,9 +210,11 @@ public static class NavigationTools
         string symbol,
         [Description("up|down|both (default both).")]
         string direction = "both",
+        [Description("Max derived/implementing types listed, 1-200 (default 50).")]
         int max_results = 50)
         => ToolRunner.Run(loggerFactory.CreateLogger("mcp-roslyn"), "get_type_hierarchy", async () =>
         {
+            max_results = Math.Clamp(max_results <= 0 ? Paging.DefaultMax : max_results, 1, Paging.MaxAllowed);
             var solution = await workspace.GetSolutionAsync(ct);
             var resolved = await SymbolResolver.ResolveOrThrowAsync(solution, symbol, ct);
             if (resolved.Symbol is not INamedTypeSymbol type)
@@ -225,7 +256,7 @@ public static class NavigationTools
                     .ToList();
 
                 sb.AppendLine($"derived/implementing ({unique.Count}{(unique.Count > max_results ? $", showing {max_results}" : "")}):");
-                foreach (var d in unique.Take(Math.Clamp(max_results, 1, Paging.MaxAllowed)))
+                foreach (var d in unique.Take(max_results))
                     sb.AppendLine($"  {SymbolFormat.KindOf(d)} {SymbolFormat.FqnOf(d)} — {SymbolFormat.PrimaryLocation(d, workspace.RelPath)}");
                 if (unique.Count == 0)
                     sb.AppendLine("  (none in the loaded solution)");
@@ -248,7 +279,7 @@ public static class NavigationTools
         string direction = "callers",
         [Description("Levels to expand, 1-3 (default 1).")]
         int depth = 1,
-        [Description("Max entries per level (default 25).")]
+        [Description("Max entries per level, 1-100 (default 25).")]
         int max_results = 25)
         => ToolRunner.Run(loggerFactory.CreateLogger("mcp-roslyn"), "call_hierarchy", async () =>
         {
@@ -261,16 +292,18 @@ public static class NavigationTools
             var sb = new StringBuilder();
             var dir = direction.Trim().ToLowerInvariant();
             var budget = 150;
+            // Each caller expansion is a solution-wide search; bound wall-clock, not just lines.
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
 
             if (dir is "callers" or "")
             {
                 sb.AppendLine($"callers of {SymbolFormat.FqnOf(target)} (depth {depth}):");
-                await RenderCallersAsync(sb, target, solution, workspace, depth, 0, max_results, new HashSet<string>(), budget, ct);
+                await RenderCallersAsync(sb, target, solution, workspace, depth, 0, max_results, new HashSet<string>(), budget, deadline, ct);
             }
             else if (dir == "callees")
             {
                 sb.AppendLine($"callees of {SymbolFormat.FqnOf(target)} (depth {depth}):");
-                await RenderCalleesAsync(sb, target, solution, workspace, depth, 0, max_results, new HashSet<string>(), budget, ct);
+                await RenderCalleesAsync(sb, target, solution, workspace, depth, 0, max_results, new HashSet<string>(), budget, deadline, ct);
             }
             else
             {
@@ -282,7 +315,7 @@ public static class NavigationTools
 
     private static async Task<int> RenderCallersAsync(
         StringBuilder sb, ISymbol target, Solution solution, RoslynWorkspaceService workspace,
-        int remainingDepth, int indentLevel, int maxPerLevel, HashSet<string> visited, int budget, CancellationToken ct)
+        int remainingDepth, int indentLevel, int maxPerLevel, HashSet<string> visited, int budget, DateTime deadline, CancellationToken ct)
     {
         var callers = (await SymbolFinder.FindCallersAsync(target, solution, ct))
             .GroupBy(c => c.CallingSymbol.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(c.CallingSymbol))
@@ -317,8 +350,15 @@ public static class NavigationTools
 
             var key = caller.Symbol.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(caller.Symbol);
             if (remainingDepth > 1 && visited.Add(key))
+            {
+                if (DateTime.UtcNow >= deadline)
+                {
+                    sb.AppendLine($"{indent}… time budget reached — narrow with a smaller depth or max_results.");
+                    return 0;
+                }
                 budget = await RenderCallersAsync(sb, caller.Symbol, solution, workspace,
-                    remainingDepth - 1, indentLevel + 1, maxPerLevel, visited, budget, ct);
+                    remainingDepth - 1, indentLevel + 1, maxPerLevel, visited, budget, deadline, ct);
+            }
         }
 
         if (callers.Count > maxPerLevel)
@@ -328,7 +368,7 @@ public static class NavigationTools
 
     private static async Task<int> RenderCalleesAsync(
         StringBuilder sb, ISymbol target, Solution solution, RoslynWorkspaceService workspace,
-        int remainingDepth, int indentLevel, int maxPerLevel, HashSet<string> visited, int budget, CancellationToken ct)
+        int remainingDepth, int indentLevel, int maxPerLevel, HashSet<string> visited, int budget, DateTime deadline, CancellationToken ct)
     {
         var callees = await CollectCalleesAsync(target, solution, ct);
         var indent = new string(' ', indentLevel * 2);
@@ -354,8 +394,15 @@ public static class NavigationTools
 
             var key = callee.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(callee);
             if (remainingDepth > 1 && callee.Locations.Any(l => l.IsInSource) && visited.Add(key))
+            {
+                if (DateTime.UtcNow >= deadline)
+                {
+                    sb.AppendLine($"{indent}… time budget reached.");
+                    return 0;
+                }
                 budget = await RenderCalleesAsync(sb, callee, solution, workspace,
-                    remainingDepth - 1, indentLevel + 1, maxPerLevel, visited, budget, ct);
+                    remainingDepth - 1, indentLevel + 1, maxPerLevel, visited, budget, deadline, ct);
+            }
         }
 
         if (callees.Count > maxPerLevel)

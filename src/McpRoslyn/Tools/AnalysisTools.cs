@@ -29,9 +29,11 @@ public static class AnalysisTools
         string? target = null,
         [Description("error|warning|info|hidden (default warning).")]
         string? min_severity = null,
-        [Description("Also run the project's Roslyn analyzers (CA/IDE rules). Slower; executes analyzer assemblies referenced by the project.")]
+        [Description("Also run the project's Roslyn analyzers (CA/IDE rules). Slower; executes analyzer assemblies referenced by the project. File scope runs tree-scoped analysis (skips whole-project rules).")]
         bool include_analyzers = false,
+        [Description("Page size, 1-200 (default 50).")]
         int max_results = 50,
+        [Description("1-based page number.")]
         int page = 1)
         => ToolRunner.Run(loggerFactory.CreateLogger("mcp-roslyn"), "get_diagnostics", async () =>
         {
@@ -50,12 +52,12 @@ public static class AnalysisTools
                 diagnostics.AddRange(semanticModel.GetDiagnostics(cancellationToken: ct));
                 scopeDescription = workspace.RelPath(document.FilePath);
                 if (include_analyzers)
-                    diagnostics.AddRange(await AnalyzerDiagnosticsAsync(document.Project, ct, document.FilePath));
+                    diagnostics.AddRange(await DocumentAnalyzerDiagnosticsAsync(document, semanticModel, ct));
             }
             else if (target is { Length: > 0 })
             {
                 var project = ToolHelpers.FindProject(solution, target);
-                diagnostics.AddRange(await ProjectDiagnosticsAsync(project, include_analyzers, ct));
+                diagnostics.AddRange(await ProjectDiagnosticsAsync(project, include_analyzers, minSeverity, ct));
                 scopeDescription = $"project {project.Name}";
             }
             else
@@ -67,7 +69,7 @@ public static class AnalysisTools
                     await semaphore.WaitAsync(ct);
                     try
                     {
-                        return await ProjectDiagnosticsAsync(p, include_analyzers, ct);
+                        return await ProjectDiagnosticsAsync(p, include_analyzers, minSeverity, ct);
                     }
                     finally
                     {
@@ -96,31 +98,51 @@ public static class AnalysisTools
             return ToolHelpers.WithStaleNotice(output, workspace);
         });
 
-    private static async Task<List<Diagnostic>> ProjectDiagnosticsAsync(Project project, bool includeAnalyzers, CancellationToken ct)
+    private static async Task<List<Diagnostic>> ProjectDiagnosticsAsync(
+        Project project, bool includeAnalyzers, DiagnosticSeverity minSeverity, CancellationToken ct)
     {
+        // Filter before returning so a solution-wide sweep never retains the (potentially huge)
+        // hidden/info analyzer output of every project at once.
         var compilation = await project.GetCompilationAsync(ct);
         if (compilation is null)
             return [];
 
         if (!includeAnalyzers)
-            return [.. compilation.GetDiagnostics(ct)];
+            return compilation.GetDiagnostics(ct).Where(d => d.Severity >= minSeverity).ToList();
 
         var analyzers = project.AnalyzerReferences
             .SelectMany(r => r.GetAnalyzers(project.Language))
             .ToImmutableArray();
         if (analyzers.IsEmpty)
-            return [.. compilation.GetDiagnostics(ct)];
+            return compilation.GetDiagnostics(ct).Where(d => d.Severity >= minSeverity).ToList();
 
         var withAnalyzers = compilation.WithAnalyzers(analyzers, project.AnalyzerOptions);
-        return [.. await withAnalyzers.GetAllDiagnosticsAsync(ct)];
+        return (await withAnalyzers.GetAllDiagnosticsAsync(ct)).Where(d => d.Severity >= minSeverity).ToList();
     }
 
-    private static async Task<List<Diagnostic>> AnalyzerDiagnosticsAsync(Project project, CancellationToken ct, string? onlyFile)
+    /// <summary>
+    /// Tree-scoped analyzer run for one document — avoids executing the analyzers over the whole
+    /// project for a one-file question. Skips compilation-end (whole-project) rules by design.
+    /// </summary>
+    private static async Task<List<Diagnostic>> DocumentAnalyzerDiagnosticsAsync(
+        Document document, SemanticModel semanticModel, CancellationToken ct)
     {
-        var all = await ProjectDiagnosticsAsync(project, includeAnalyzers: true, ct);
-        return onlyFile is null
-            ? all
-            : all.Where(d => string.Equals(d.Location.SourceTree?.FilePath, onlyFile, StringComparison.OrdinalIgnoreCase)).ToList();
+        var project = document.Project;
+        var analyzers = project.AnalyzerReferences
+            .SelectMany(r => r.GetAnalyzers(project.Language))
+            .ToImmutableArray();
+        if (analyzers.IsEmpty)
+            return [];
+
+        var compilation = await project.GetCompilationAsync(ct);
+        if (compilation is null)
+            return [];
+
+        var withAnalyzers = compilation.WithAnalyzers(analyzers, project.AnalyzerOptions);
+        var result = new List<Diagnostic>();
+        result.AddRange(await withAnalyzers.GetAnalyzerSyntaxDiagnosticsAsync(semanticModel.SyntaxTree, ct));
+        result.AddRange(await withAnalyzers.GetAnalyzerSemanticDiagnosticsAsync(semanticModel, filterSpan: null, ct));
+        return result;
     }
 
     private static string DiagnosticKey(Diagnostic d)
@@ -149,7 +171,11 @@ public static class AnalysisTools
         ILoggerFactory loggerFactory,
         CancellationToken ct,
         [Description("Include NuGet package references per project (default true).")]
-        bool include_packages = true)
+        bool include_packages = true,
+        [Description("Projects per page, 1-200 (default 50).")]
+        int max_results = 50,
+        [Description("1-based page number.")]
+        int page = 1)
         => ToolRunner.Run(loggerFactory.CreateLogger("mcp-roslyn"), "get_project_graph", async () =>
         {
             var solution = await workspace.GetSolutionAsync(ct);
@@ -158,44 +184,46 @@ public static class AnalysisTools
                 .OrderBy(g => g.First().Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            var sb = new StringBuilder();
-            sb.AppendLine($"{groups.Count} project(s) in {workspace.SolutionPath}:");
-
-            foreach (var group in groups)
-            {
-                ct.ThrowIfCancellationRequested();
-                var project = group.First();
-                var tfms = group.Select(p => TfmSuffix(p.Name)).Where(t => t is not null).Distinct().ToList();
-                var outputKind = project.CompilationOptions?.OutputKind switch
+            var output = Paging.Render(
+                groups, page, max_results, $"project(s) in {workspace.SolutionPath}",
+                group =>
                 {
-                    OutputKind.ConsoleApplication or OutputKind.WindowsApplication => "exe",
-                    OutputKind.DynamicallyLinkedLibrary => "dll",
-                    var k => k?.ToString().ToLowerInvariant() ?? "?",
-                };
-                var references = group
-                    .SelectMany(p => p.ProjectReferences)
-                    .Select(r => solution.GetProject(r.ProjectId)?.Name)
-                    .Where(n => n is not null)
-                    .Select(n => StripTfm(n!))
-                    .Distinct()
-                    .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
+                    var project = group.First();
+                    var tfms = group.Select(p => TfmSuffix(p.Name)).Where(t => t is not null).Distinct().ToList();
+                    var outputKind = project.CompilationOptions?.OutputKind switch
+                    {
+                        OutputKind.ConsoleApplication or OutputKind.WindowsApplication => "exe",
+                        OutputKind.DynamicallyLinkedLibrary => "dll",
+                        var k => k?.ToString().ToLowerInvariant() ?? "?",
+                    };
+                    var references = group
+                        .SelectMany(p => p.ProjectReferences)
+                        .Select(r => solution.GetProject(r.ProjectId)?.Name)
+                        .Where(n => n is not null)
+                        .Select(n => StripTfm(n!))
+                        .Distinct()
+                        .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
 
-                sb.Append($"{StripTfm(project.Name)}{(tfms.Count > 0 ? $" [{string.Join(";", tfms)}]" : "")}"
-                          + $" {(project.Language == "Visual Basic" ? "VB" : project.Language)} {outputKind} — {project.DocumentIds.Count} files");
-                if (references.Count > 0)
-                    sb.Append(" → refs: " + string.Join(", ", references));
-                sb.AppendLine();
+                    var line = $"{StripTfm(project.Name)}{(tfms.Count > 0 ? $" [{string.Join(";", tfms)}]" : "")}"
+                               + $" {(project.Language == "Visual Basic" ? "VB" : project.Language)} {outputKind} — {project.DocumentIds.Count} files";
+                    if (references.Count > 0)
+                    {
+                        line += " → refs: " + string.Join(", ", references.Take(20));
+                        if (references.Count > 20)
+                            line += $" +{references.Count - 20} more";
+                    }
 
-                if (include_packages && project.FilePath is not null)
-                {
-                    var packages = ReadPackages(project.FilePath);
-                    if (packages.Count > 0)
-                        sb.AppendLine("  packages: " + string.Join(", ", packages.Take(40)));
-                }
-            }
+                    if (include_packages && project.FilePath is not null)
+                    {
+                        var packages = ReadPackages(project.FilePath);
+                        if (packages.Count > 0)
+                            line += "\n  packages: " + string.Join(", ", packages.Take(40));
+                    }
+                    return line;
+                });
 
-            return ToolHelpers.WithStaleNotice(sb.ToString().TrimEnd(), workspace);
+            return ToolHelpers.WithStaleNotice(output, workspace);
         });
 
     private static string? TfmSuffix(string projectName)
@@ -261,7 +289,9 @@ public static class AnalysisTools
         string? target = null,
         [Description("Also check public/protected symbols (more false positives if this solution is consumed elsewhere).")]
         bool include_public = false,
+        [Description("Page size, 1-200 (default 50).")]
         int max_results = 50,
+        [Description("1-based page number.")]
         int page = 1)
         => ToolRunner.Run(loggerFactory.CreateLogger("mcp-roslyn"), "find_unused", async () =>
         {
@@ -273,9 +303,20 @@ public static class AnalysisTools
 
             if (target is null or "")
             {
-                foreach (var project in SymbolResolver.DistinctByProjectFile(solution))
+                // Stop collecting once the cap is exceeded — don't force compilations of projects
+                // whose candidates would be discarded anyway. Report which projects were covered.
+                var projects = SymbolResolver.DistinctByProjectFile(solution).ToList();
+                var covered = new List<string>();
+                foreach (var project in projects)
+                {
+                    if (candidates.Count > maxChecked)
+                        break;
                     candidates.AddRange(await CollectCandidatesAsync(project, include_public, ct));
-                scopeDescription = "solution";
+                    covered.Add(StripTfm(project.Name));
+                }
+                scopeDescription = covered.Count < projects.Count
+                    ? $"solution (cap reached after {covered.Count} of {projects.Count} projects: {string.Join(", ", covered)} — pass a project name to scan the rest)"
+                    : "solution";
             }
             else if (solution.Projects.Any(p => p.Name.Contains(target, StringComparison.OrdinalIgnoreCase)))
             {
@@ -496,8 +537,17 @@ public static class AnalysisTools
 
         if (target is IMethodSymbol or IPropertySymbol)
         {
-            var callers = (await SymbolFinder.FindCallersAsync(target, solution, ct)).Count();
-            sb.AppendLine($"direct callers: {callers}");
+            // Derive the caller count from the references we already fetched instead of paying a
+            // second whole-solution search (FindCallersAsync re-runs FindReferencesAsync inside).
+            var callers = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+            foreach (var location in locations)
+            {
+                var model = await location.Document.GetSemanticModelAsync(ct);
+                var enclosing = model?.GetEnclosingSymbol(location.Location.SourceSpan.Start, ct);
+                if (enclosing is not null)
+                    callers.Add(enclosing);
+            }
+            sb.AppendLine($"calling members: {callers.Count}");
         }
 
         var files = locations.Select(l => l.Document.FilePath).Distinct(StringComparer.OrdinalIgnoreCase).Take(15).ToList();

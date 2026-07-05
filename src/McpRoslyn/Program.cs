@@ -32,8 +32,9 @@ builder.Services
             "Read-only Roslyn code analysis for C#/VB.NET solutions. Use these tools instead of grep when you need " +
             "semantic exactness: find_references, find_implementations, call_hierarchy, get_diagnostics, or to look " +
             "inside NuGet/BCL assemblies (decompile). Symbols are addressed by (fuzzy) fully-qualified name, e.g. " +
-            "'OrderService.Process' — never by line/column. A solution is auto-loaded from the working directory; " +
-            "use load_solution to switch. Results reflect files on disk (auto-synced after edits).";
+            "'OrderService.Process' (get_symbol also accepts file+line for \"what is declared here\"). A solution is " +
+            "auto-loaded from the working directory; use load_solution to switch. Results reflect files on disk " +
+            "(auto-synced after edits).";
     })
     .WithStdioServerTransport()
     .WithToolsFromAssembly();

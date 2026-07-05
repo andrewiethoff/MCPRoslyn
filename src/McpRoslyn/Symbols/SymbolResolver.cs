@@ -305,44 +305,76 @@ public static class SymbolResolver
     private static async Task<List<ResolvedSymbol>> FindMetadataMatchesAsync(
         Solution solution, ParsedQuery parsed, CancellationToken ct)
     {
+        // Metadata names are fully qualified, so any project that can see the assembly resolves
+        // the same symbol (deduped by doc-ID anyway). Probe cheaply first: projects whose
+        // compilation is already realized. Only then force compilations, stopping at the first
+        // project that yields a match — never realize the whole solution for one lookup.
+        var projects = DistinctByProjectFile(solution).ToList();
+        var realized = new List<(Project Project, Compilation Compilation)>();
+        var unrealized = new List<Project>();
+        foreach (var project in projects)
+        {
+            if (project.TryGetCompilation(out var compilation))
+                realized.Add((project, compilation));
+            else
+                unrealized.Add(project);
+        }
+
         var results = new List<ResolvedSymbol>();
         var seenAssemblies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var project in DistinctByProjectFile(solution))
+        foreach (var (project, compilation) in realized)
+        {
+            ct.ThrowIfCancellationRequested();
+            ProbeCompilation(compilation, project, parsed, results, seenAssemblies);
+        }
+        if (results.Count > 0)
+            return results;
+
+        // Bigger reference closures first: they can see the most assemblies.
+        foreach (var project in unrealized.OrderByDescending(p => p.MetadataReferences.Count))
         {
             ct.ThrowIfCancellationRequested();
             var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
             if (compilation is null)
                 continue;
-
-            // Try the full segment list as a type, then all-but-last as a type + member.
-            var asType = FindMetadataType(compilation, parsed.Segments, parsed.Arity);
-            if (asType is not null && !parsed.IsConstructor && parsed.ParameterTypes is null)
-            {
-                if (seenAssemblies.Add($"{asType.ContainingAssembly?.Name}|{asType.GetDocumentationCommentId()}"))
-                    results.Add(new ResolvedSymbol(asType, project));
-                continue;
-            }
-
-            var parentSegments = parsed.IsConstructor ? parsed.Segments : parsed.Segments[..^1];
-            if (parentSegments.Length == 0)
-                continue;
-            var parentType = FindMetadataType(compilation, parentSegments, parsed.IsConstructor ? parsed.Arity : null);
-            if (parentType is null)
-                continue;
-
-            var members = parsed.IsConstructor
-                ? parentType.InstanceConstructors.Cast<ISymbol>()
-                : parentType.GetMembers().Where(m => string.Equals(m.Name, parsed.Segments[^1], StringComparison.OrdinalIgnoreCase));
-
-            foreach (var member in members.Where(m => MatchesParameters(m, parsed.ParameterTypes)))
-            {
-                if (seenAssemblies.Add($"{member.ContainingAssembly?.Name}|{member.GetDocumentationCommentId()}"))
-                    results.Add(new ResolvedSymbol(member, project));
-            }
+            ProbeCompilation(compilation, project, parsed, results, seenAssemblies);
+            if (results.Count > 0)
+                return results;
         }
 
         return results;
+    }
+
+    private static void ProbeCompilation(
+        Compilation compilation, Project project, ParsedQuery parsed,
+        List<ResolvedSymbol> results, HashSet<string> seenAssemblies)
+    {
+        // Try the full segment list as a type, then all-but-last as a type + member.
+        var asType = FindMetadataType(compilation, parsed.Segments, parsed.Arity);
+        if (asType is not null && !parsed.IsConstructor && parsed.ParameterTypes is null)
+        {
+            if (seenAssemblies.Add($"{asType.ContainingAssembly?.Name}|{asType.GetDocumentationCommentId()}"))
+                results.Add(new ResolvedSymbol(asType, project));
+            return;
+        }
+
+        var parentSegments = parsed.IsConstructor ? parsed.Segments : parsed.Segments[..^1];
+        if (parentSegments.Length == 0)
+            return;
+        var parentType = FindMetadataType(compilation, parentSegments, parsed.IsConstructor ? parsed.Arity : null);
+        if (parentType is null)
+            return;
+
+        var members = parsed.IsConstructor
+            ? parentType.InstanceConstructors.Cast<ISymbol>()
+            : parentType.GetMembers().Where(m => string.Equals(m.Name, parsed.Segments[^1], StringComparison.OrdinalIgnoreCase));
+
+        foreach (var member in members.Where(m => MatchesParameters(m, parsed.ParameterTypes)))
+        {
+            if (seenAssemblies.Add($"{member.ContainingAssembly?.Name}|{member.GetDocumentationCommentId()}"))
+                results.Add(new ResolvedSymbol(member, project));
+        }
     }
 
     /// <summary>Projects deduplicated by project file (multi-TFM projects appear once per TFM).</summary>
@@ -423,7 +455,26 @@ public static class SymbolResolver
 
     private static async Task<ResolvedSymbol?> ResolveDocIdAsync(Solution solution, string docId, CancellationToken ct)
     {
-        foreach (var project in DistinctByProjectFile(solution))
+        // Doc-IDs are this server's own re-query currency (ambiguity errors print them), so this
+        // is a hot path: probe already-realized compilations first — the fuzzy pass that produced
+        // the doc-ID usually realized the right one — before forcing any compilation.
+        var projects = DistinctByProjectFile(solution).ToList();
+        var unrealized = new List<Project>();
+
+        foreach (var project in projects)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!project.TryGetCompilation(out var compilation))
+            {
+                unrealized.Add(project);
+                continue;
+            }
+            var symbol = DocumentationCommentId.GetFirstSymbolForDeclarationId(docId, compilation);
+            if (symbol is not null)
+                return new ResolvedSymbol(symbol, project);
+        }
+
+        foreach (var project in unrealized.OrderByDescending(p => p.MetadataReferences.Count))
         {
             ct.ThrowIfCancellationRequested();
             var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
