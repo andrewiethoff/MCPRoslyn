@@ -158,23 +158,27 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
             _ => -1,
         };
 
-        // Prefer an exact match on the XML documentation id: it encodes the full signature
-        // (parameter types, generic arity, indexer parameters) so overloads with the same name and
-        // arity resolve to the one the caller actually asked for, not an arbitrary sibling.
+        // 1. Exact match on the XML documentation id: it encodes the full signature, so overloads
+        //    with the same name and arity resolve to the one the caller asked for. Precise for the
+        //    overwhelming majority.
         var docId = symbol.GetDocumentationCommentId();
-        List<IMember> members;
         var exact = docId is null
             ? null
             : typeDefinition.Members.FirstOrDefault(m => IdMatches(m, docId));
+
+        List<IMember> members;
+        var approximate = false;
         if (exact is not null)
         {
             members = [exact];
         }
         else
         {
-            // Fallback (compiler-generated / IL-renamed members whose ids will not match): name and
-            // parameter count, capped so an ambiguous match at least shows the candidates.
-            members = typeDefinition.Members
+            // 2. Fallback: name (+ ctor kind) and parameter count. The doc-id match can miss even
+            //    when the member exists, because the decompiler's id-string and Roslyn's doc-id
+            //    disagree for a few type families — native ints render as nint/nuint vs
+            //    System.IntPtr/UIntPtr, and tuples drop their generic arguments.
+            var named = typeDefinition.Members
                 .Where(m => wantCtor
                     ? m is IMethod { IsConstructor: true }
                     : string.Equals(m.Name, symbol.MetadataName, StringComparison.Ordinal)
@@ -182,8 +186,26 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
                 .Where(m => parameterCount < 0
                             || m is not IParameterizedMember pm
                             || pm.Parameters.Count == parameterCount)
-                .Take(3)
                 .ToList();
+
+            // 3. Disambiguate overloads by comparing parameter type simple-names, which DO agree
+            //    across the two type systems even where the id-strings diverge (both call native int
+            //    "IntPtr" and both call a tuple "ValueTuple").
+            var narrowed = named.Count > 1
+                ? named.Where(m => m is IParameterizedMember pm && ParameterTypesMatch(pm, symbol)).ToList()
+                : named;
+
+            if (narrowed.Count == 1)
+            {
+                members = narrowed;
+            }
+            else
+            {
+                // Still ambiguous (or narrowing eliminated everything): show a few candidates, but
+                // say so — never silently present the wrong overload as if it were the one requested.
+                members = (narrowed.Count > 0 ? narrowed : named).Take(3).ToList();
+                approximate = members.Count > 1;
+            }
         }
 
         if (members.Count == 0)
@@ -192,6 +214,9 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
                 + "(it may be compiler-generated or renamed in IL). Decompile the whole type instead.");
 
         var sb = new StringBuilder();
+        if (approximate)
+            sb.AppendLine($"// NOTE: could not pin down the exact overload of '{symbol.Name}'; "
+                          + $"showing {members.Count} candidate(s) with a matching name/arity.");
         foreach (var member in members)
         {
             if (sb.Length > 0)
@@ -203,7 +228,9 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
 
     /// <summary>
     /// True when a decompiler member's XML documentation id equals the Roslyn symbol's. Both follow
-    /// the ECMA-334 doc-id format, so this is an exact signature comparison.
+    /// the ECMA-334 doc-id format — but note the decompiler renders native-int and tuple types
+    /// differently, so a false here does not prove a different member (see the fallback in
+    /// <see cref="DecompileMembers"/>).
     /// </summary>
     private static bool IdMatches(IEntity member, string docId)
     {
@@ -217,6 +244,68 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
             return false;
         }
     }
+
+    /// <summary>
+    /// True when a decompiler member's parameter types match the Roslyn symbol's, compared by a
+    /// recursive simple-name signature (element/array/generic-argument names). These names agree
+    /// across the two type systems for exactly the cases the doc-id rendering disagrees on.
+    /// </summary>
+    private static bool ParameterTypesMatch(IParameterizedMember member, ISymbol symbol)
+    {
+        try
+        {
+            var roslynParameters = symbol switch
+            {
+                IMethodSymbol m => m.Parameters,
+                IPropertySymbol p => p.Parameters,
+                _ => default,
+            };
+            if (roslynParameters.IsDefault || member.Parameters.Count != roslynParameters.Length)
+                return false;
+
+            for (var i = 0; i < roslynParameters.Length; i++)
+            {
+                if (!string.Equals(DecompilerTypeSig(member.Parameters[i].Type),
+                                   RoslynTypeSig(roslynParameters[i].Type), StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string RoslynTypeSig(Microsoft.CodeAnalysis.ITypeSymbol type) => type switch
+    {
+        IArrayTypeSymbol array => RoslynTypeSig(array.ElementType) + "[]",
+        INamedTypeSymbol { TypeArguments.Length: > 0 } named =>
+            CanonicalTypeName(named.Name) + "<" + string.Join(",", named.TypeArguments.Select(RoslynTypeSig)) + ">",
+        _ => CanonicalTypeName(type.Name),
+    };
+
+    private static string DecompilerTypeSig(IType type)
+    {
+        if (type is ByReferenceType byRef)
+            return DecompilerTypeSig(byRef.ElementType);
+        if (type is ArrayType array)
+            return DecompilerTypeSig(array.ElementType) + "[]";
+        if (type.TypeArguments.Count > 0)
+            return CanonicalTypeName(type.Name) + "<" + string.Join(",", type.TypeArguments.Select(DecompilerTypeSig)) + ">";
+        return CanonicalTypeName(type.Name);
+    }
+
+    // The two type systems disagree on how they spell native ints (nint vs IntPtr); canonicalize so
+    // the parameter-type comparison is not fooled by the rendering that broke the doc-id match.
+    private static string CanonicalTypeName(string name) => name switch
+    {
+        "nint" => "IntPtr",
+        "nuint" => "UIntPtr",
+        _ => name,
+    };
 
     /// <summary>The requested assembly, plus runtime-implementation fallbacks for reference assemblies.</summary>
     private static IEnumerable<string> CandidatePaths(string assemblyPath, bool isReferenceAssembly)

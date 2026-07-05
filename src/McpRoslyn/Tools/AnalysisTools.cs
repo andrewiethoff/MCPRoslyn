@@ -169,6 +169,30 @@ public static class AnalysisTools
     private static string DiagnosticMatchKey(Diagnostic d) =>
         $"{d.Id}|{d.Location.GetLineSpan().Path}|{d.GetMessage()}";
 
+    /// <summary>
+    /// Folds one compilation's diagnostics into a per-key running MAX count (max across the TFM
+    /// flavors already folded in), and, when <paramref name="samples"/> is given, records the actual
+    /// diagnostic objects per key so introduced ones can be rendered with their real locations.
+    /// </summary>
+    private static void MergeMaxCounts(
+        Dictionary<string, int> maxCounts, List<Diagnostic> diagnostics, Dictionary<string, List<Diagnostic>>? samples)
+    {
+        var counts = new Dictionary<string, int>();
+        foreach (var d in diagnostics)
+        {
+            var key = DiagnosticMatchKey(d);
+            counts[key] = counts.GetValueOrDefault(key) + 1;
+            if (samples is not null)
+            {
+                if (!samples.TryGetValue(key, out var list))
+                    samples[key] = list = [];
+                list.Add(d);
+            }
+        }
+        foreach (var (key, count) in counts)
+            maxCounts[key] = Math.Max(maxCounts.GetValueOrDefault(key), count);
+    }
+
     /// <summary>All target-framework flavors of a project (identified by shared project file path).</summary>
     private static List<Project> AllTfmFlavors(Solution solution, Project project) =>
         project.FilePath is null
@@ -626,10 +650,15 @@ public static class AnalysisTools
         {
             ct.ThrowIfCancellationRequested();
 
-            // Merge introduced/resolved across this project's TFM flavors, keyed line-insensitively
-            // so a benign line shift is never reported as a break.
-            var introducedByKey = new Dictionary<string, Diagnostic>();
-            var resolvedKeys = new HashSet<string>();
+            // Diff old vs new per TFM flavor with MULTISET counts keyed line-insensitively, taking
+            // the MAX count across flavors per key. Line-insensitive so a benign line shift is not a
+            // break; multiset so a genuinely-added duplicate (id+message identical to a pre-existing
+            // one) is still counted; MAX-across-flavors so a diagnostic every framework emits is not
+            // multiplied, and one that only some frameworks lose is only "resolved" once the whole
+            // build loses it.
+            var oldMax = new Dictionary<string, int>();
+            var newMax = new Dictionary<string, int>();
+            var newSamples = new Dictionary<string, List<Diagnostic>>();
 
             foreach (var project in projectGroup)
             {
@@ -639,20 +668,20 @@ public static class AnalysisTools
                 if (oldCompilation is null || newCompilation is null)
                     continue;
 
-                var oldDiagnostics = Significant(oldCompilation.GetDiagnostics(ct));
-                var newDiagnostics = Significant(newCompilation.GetDiagnostics(ct));
-
-                var oldKeys = oldDiagnostics.Select(DiagnosticMatchKey).ToHashSet();
-                var newKeys = newDiagnostics.Select(DiagnosticMatchKey).ToHashSet();
-
-                foreach (var d in newDiagnostics.Where(d => !oldKeys.Contains(DiagnosticMatchKey(d))))
-                    introducedByKey.TryAdd(DiagnosticMatchKey(d), d);
-                foreach (var d in oldDiagnostics.Where(d => !newKeys.Contains(DiagnosticMatchKey(d))))
-                    resolvedKeys.Add(DiagnosticMatchKey(d));
+                MergeMaxCounts(oldMax, Significant(oldCompilation.GetDiagnostics(ct)), null);
+                MergeMaxCounts(newMax, Significant(newCompilation.GetDiagnostics(ct)), newSamples);
             }
 
-            var introduced = introducedByKey.Values.ToList();
-            var resolved = resolvedKeys.Count;
+            var introduced = new List<Diagnostic>();
+            var resolved = 0;
+            foreach (var key in newMax.Keys.Union(oldMax.Keys))
+            {
+                var delta = newMax.GetValueOrDefault(key) - oldMax.GetValueOrDefault(key);
+                if (delta > 0 && newSamples.TryGetValue(key, out var samples))
+                    introduced.AddRange(samples.Take(delta));
+                else if (delta < 0)
+                    resolved += -delta;
+            }
             totalNew += introduced.Count;
             totalFixed += resolved;
 

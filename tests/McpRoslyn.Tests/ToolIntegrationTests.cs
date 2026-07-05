@@ -235,4 +235,50 @@ public class ToolIntegrationTests(FixtureWorkspace fixture)
         Assert.Contains("source (not decompiled)", output);
         Assert.Contains("Side * Side", output);
     }
+
+    [Fact]
+    public async Task GetSymbol_ResolvesOverloadByFullyQualifiedPrimitive()
+    {
+        // "System.Int64" must map to the keyword 'long' just like "System.Int32" maps to 'int'.
+        var output = await SearchTools.GetSymbol(Ws, Lf, Ct, symbol: "Processor.Scale(System.Int64)");
+        Assert.Contains("Scale", output);
+        Assert.Contains("long", output);
+    }
+
+    [Fact]
+    public async Task Decompile_NativeIntOverloadIsNotSilentlyWrong()
+    {
+        // Math.Max(nint,nint): the decompiler renders native int as 'nint' while Roslyn's doc-id
+        // uses System.IntPtr, so the id match misses — the parameter-type fallback must still pick
+        // the nint overload, not the arbitrary byte/decimal/double siblings.
+        var output = await DecompileTools.Decompile(Ws, fixture.Decompiler, Lf, Ct, "System.Math.Max(nint, nint)");
+        Assert.Contains("nint", output);
+        Assert.DoesNotContain("decimal", output);
+        Assert.DoesNotContain("double", output);
+    }
+
+    [Fact]
+    public async Task AnalyzeImpact_AddingADuplicateDiagnosticIsCounted()
+    {
+        // Warnings.cs already has one CS0219 (unused 'x'); adding a second method with an identically
+        // worded CS0219 is a real new warning. A set-based diff would hide it behind the same key.
+        var newContent = """
+            namespace FixtureCore;
+
+            public static class Warnings
+            {
+                public static void A()
+                {
+                    int x = 1;
+                }
+                public static void B()
+                {
+                    int x = 1;
+                }
+            }
+            """;
+        var output = await AnalysisTools.AnalyzeImpact(Ws, Lf, Ct, file: "Warnings.cs", new_content: newContent);
+        Assert.Contains("✖", output);
+        Assert.Contains("CS0219", output);
+    }
 }

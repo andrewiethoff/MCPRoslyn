@@ -642,6 +642,12 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
         {
             var solution = _solution ?? throw new ToolException("No solution loaded. Call load_solution first.");
 
+            // Low-water mark for the next resync scan: capture BEFORE draining/processing. If a file
+            // is modified while this apply runs and its watcher event is dropped (buffer overflow),
+            // its mtime will exceed this timestamp and the next resync re-enqueues it. Advancing the
+            // mark to post-processing time (DateTime.UtcNow at the end) would blind that window.
+            var syncStartUtc = DateTime.UtcNow;
+
             if (_resyncNeeded)
             {
                 // The watcher overflowed or errored: re-arm it and reconcile by timestamp so we
@@ -758,7 +764,7 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
             }
 
             _solution = solution;
-            _lastSyncUtc = DateTime.UtcNow;
+            _lastSyncUtc = syncStartUtc;
             return solution;
         }
         finally
@@ -798,7 +804,15 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
                 var defaultsDisabled = root.Descendants()
                     .Where(e => e.Name.LocalName is "EnableDefaultCompileItems" or "EnableDefaultItems")
                     .Any(e => string.Equals(e.Value.Trim(), "false", StringComparison.OrdinalIgnoreCase));
-                return !defaultsDisabled;
+                if (defaultsDisabled)
+                    return false;
+
+                // A <Compile Remove .../> narrows the implicit glob, so a file in the directory is
+                // not necessarily compiled. Be conservative and require a deliberate reload rather
+                // than materialize a document the real build would exclude.
+                var narrowsCompileItems = root.Descendants()
+                    .Any(e => e.Name.LocalName == "Compile" && e.Attribute("Remove") is not null);
+                return !narrowsCompileItems;
             }
             catch
             {

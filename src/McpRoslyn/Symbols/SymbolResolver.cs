@@ -137,15 +137,22 @@ public static class SymbolResolver
         return new ParsedQuery([.. segments], parameters, arity, isCtor);
     }
 
+    private static readonly string[] ParameterModifiers = ["out ", "ref readonly ", "ref ", "in ", "params "];
+
     private static string StripParameterName(string parameter)
     {
         // "int count" -> "int"; "out string x" -> "string"; keep generic args intact.
-        var cleaned = parameter
-            .Replace("out ", "", StringComparison.OrdinalIgnoreCase)
-            .Replace("ref ", "", StringComparison.OrdinalIgnoreCase)
-            .Replace("in ", "", StringComparison.OrdinalIgnoreCase)
-            .Replace("params ", "", StringComparison.OrdinalIgnoreCase)
-            .Trim();
+        // Strip only a LEADING modifier keyword — a global Replace would corrupt type names that
+        // merely contain "in"/"out"/"ref" before the parameter-name space (e.g. "Plugin plugin").
+        var cleaned = parameter.Trim();
+        foreach (var modifier in ParameterModifiers)
+        {
+            if (cleaned.StartsWith(modifier, StringComparison.OrdinalIgnoreCase))
+            {
+                cleaned = cleaned[modifier.Length..].TrimStart();
+                break;
+            }
+        }
         var depth = 0;
         var lastSpace = -1;
         for (var i = 0; i < cleaned.Length; i++)
@@ -304,9 +311,26 @@ public static class SymbolResolver
         return true;
     }
 
-    private static string NormalizeTypeName(string name) =>
-        name.Replace(" ", "").Replace("System.Int32", "int").Replace("System.String", "string")
-            .Replace("System.Boolean", "bool").Replace("System.Object", "object");
+    // The parameter is rendered with UseSpecialTypes (keywords), so a user-supplied fully-qualified
+    // BCL name must be mapped to the keyword to match. Covers every C# primitive alias, not just int.
+    private static readonly (string Fqn, string Keyword)[] PrimitiveAliases =
+    [
+        ("System.Int32", "int"), ("System.Int64", "long"), ("System.Int16", "short"),
+        ("System.UInt32", "uint"), ("System.UInt64", "ulong"), ("System.UInt16", "ushort"),
+        ("System.Byte", "byte"), ("System.SByte", "sbyte"),
+        ("System.Double", "double"), ("System.Single", "float"), ("System.Decimal", "decimal"),
+        ("System.Boolean", "bool"), ("System.Char", "char"), ("System.String", "string"),
+        ("System.Object", "object"), ("System.IntPtr", "nint"), ("System.UIntPtr", "nuint"),
+        ("System.Void", "void"),
+    ];
+
+    private static string NormalizeTypeName(string name)
+    {
+        var normalized = name.Replace(" ", "");
+        foreach (var (fqn, keyword) in PrimitiveAliases)
+            normalized = normalized.Replace(fqn, keyword);
+        return normalized;
+    }
 
     // ---------------------------------------------------------------- metadata resolution
 

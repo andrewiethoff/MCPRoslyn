@@ -59,7 +59,8 @@ public static class UsageClassifier
                     return Write;
                 if (argument.RefOrOutKeyword.IsKind(SyntaxKind.RefKeyword))
                     return ReadWrite;
-                return Read;
+                // A tuple element on the left of a deconstruction assignment is written, not read.
+                return IsDeconstructionTarget(expr) ? Write : Read;
             default:
                 return Read;
         }
@@ -71,7 +72,24 @@ public static class UsageClassifier
         MemberBindingExpressionSyntax binding => binding.Name == expr,
         ConditionalAccessExpressionSyntax conditional => conditional.WhenNotNull == expr,
         ParenthesizedExpressionSyntax => true,
-        ElementAccessExpressionSyntax element => element.Expression == expr,
+        // Deliberately NOT ElementAccessExpressionSyntax: the receiver of `arr[i]` is always read
+        // (the array/collection reference is dereferenced to reach an element). Climbing it would
+        // wrongly attribute an `arr[i] = x` / `arr[i]++` write to the array symbol itself.
         _ => false,
     };
+
+    /// <summary>
+    /// True when the tuple element <paramref name="element"/> sits inside a tuple that is the target
+    /// of a deconstruction assignment (`(a, b) = …`, including nested `(a, (b, c)) = …`). Such
+    /// elements are writes even though each is a plain, keyword-less argument.
+    /// </summary>
+    private static bool IsDeconstructionTarget(ExpressionSyntax element)
+    {
+        for (var current = element.Parent; current is ArgumentSyntax { Parent: TupleExpressionSyntax tuple }; current = tuple.Parent)
+        {
+            if (tuple.Parent is AssignmentExpressionSyntax assignment && assignment.Left == tuple)
+                return true;
+        }
+        return false;
+    }
 }

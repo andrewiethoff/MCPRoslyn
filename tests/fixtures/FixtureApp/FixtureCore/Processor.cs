@@ -12,6 +12,9 @@ public class Processor
     /// <summary>Processes a string.</summary>
     public string Process(string value) => $"string:{value}";
 
+    /// <summary>Scales a long (exists to exercise fully-qualified System.Int64 addressing).</summary>
+    public long Scale(long factor) => factor * 2;
+
     public int IncrementTwice()
     {
         Counter = 1;
