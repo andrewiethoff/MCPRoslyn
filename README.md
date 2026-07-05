@@ -44,7 +44,7 @@ Text search can't tell you who implements an interface, which of 300 `Process` m
 ### From source
 
 ```bash
-git clone https://github.com/<you>/MCPRoslyn
+git clone https://github.com/andrewiethoff/MCPRoslyn
 cd MCPRoslyn
 dotnet build -c Release src/McpRoslyn
 claude mcp add --scope user roslyn -- dotnet "<abs-path>/src/McpRoslyn/bin/Release/net10.0/McpRoslyn.dll"

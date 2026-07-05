@@ -24,6 +24,8 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageTags>mcp;roslyn;code-analysis;ai;agent;csharp</PackageTags>
     <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/andrewiethoff/MCPRoslyn</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/andrewiethoff/MCPRoslyn</PackageProjectUrl>
   </PropertyGroup>
 
   <ItemGroup>
