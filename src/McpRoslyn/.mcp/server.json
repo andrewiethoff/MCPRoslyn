@@ -1,0 +1,33 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+  "description": "Read-only Roslyn-powered code analysis for C#/VB.NET solutions: semantic find-references/implementations, call hierarchy, diagnostics, NuGet/BCL decompilation, impact analysis and dead-code detection for AI coding agents.",
+  "name": "io.github.andrewiethoff/MCPRoslyn",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "nuget",
+      "registryBaseUrl": "https://api.nuget.org",
+      "identifier": "MCPRoslyn",
+      "version": "0.1.0",
+      "transport": { "type": "stdio" },
+      "packageArguments": [],
+      "environmentVariables": [
+        {
+          "name": "MCPROSLYN_SOLUTION",
+          "value": "{mcproslyn_solution}",
+          "variables": {
+            "mcproslyn_solution": {
+              "description": "Optional: pin a specific .sln/.slnx/.csproj to load instead of auto-discovery.",
+              "isRequired": false,
+              "isSecret": false
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/andrewiethoff/MCPRoslyn",
+    "source": "github"
+  }
+}

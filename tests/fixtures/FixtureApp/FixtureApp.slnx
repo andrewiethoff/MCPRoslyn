@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="FixtureConsumer/FixtureConsumer.csproj" />
+  <Project Path="FixtureCore/FixtureCore.csproj" />
+  <Project Path="FixtureVb/FixtureVb.vbproj" />
+</Solution>

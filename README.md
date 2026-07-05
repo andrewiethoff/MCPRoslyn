@@ -1,0 +1,80 @@
+# MCPRoslyn
+
+**Read-only, Roslyn-powered MCP server that gives AI coding agents compiler-grade answers about C# / VB.NET solutions.**
+
+Text search can't tell you who implements an interface, which of 300 `Process` matches is *your* overload, or what's inside a NuGet assembly. Roslyn — the actual C#/VB compiler — can. MCPRoslyn puts that power behind 16 token-efficient MCP tools, strictly read-only by construction: it never writes to any analyzed file.
+
+## Highlights
+
+- **Semantic exactness**: `find_references` understands overloads, extension methods, aliases and partials — and never matches comments or strings.
+- **Sees inside assemblies**: `decompile` shows real source for NuGet/BCL APIs (metadata-as-source via ICSharpCode.Decompiler) — no more hallucinated library APIs.
+- **Impact analysis**: `analyze_impact` applies an edit *in memory*, recompiles all dependent projects and reports exactly which new errors the change would introduce. Disk is never touched.
+- **Fast diagnostics**: a warm workspace re-checks code in a fraction of `dotnet build` time.
+- **Legacy-friendly**: loads modern SDK-style projects *and* old .NET Framework (non-SDK) `.csproj` — via the Roslyn out-of-process build hosts.
+- **Never silently stale**: a file watcher applies your edits to the in-memory solution before every query.
+- **Agent-first ergonomics**: symbols addressed by fuzzy fully-qualified names (never line/column), counts-first paginated output, errors that name the recovery action.
+
+## Tools
+
+| Tool | Answers |
+|---|---|
+| `search_symbols` | "Where is anything named …?" (substring + camel-hump, kind filters) |
+| `get_symbol` | "What is X?" — signature, docs, attributes, members, overloads, locations |
+| `find_references` | "Who uses X?" — with read/write flags for fields/properties |
+| `find_implementations` | "Who implements/overrides/derives from X?" |
+| `get_type_hierarchy` | Base chain + interfaces up, derived types down |
+| `call_hierarchy` | Callers or callees, transitive to depth 3 |
+| `get_file_outline` | Structure of a file in ~1% of its tokens |
+| `get_usage_examples` | Real call-site examples for an API |
+| `get_diagnostics` | Compiler (and optional analyzer) errors/warnings — file/project/solution |
+| `get_project_graph` | Projects, references, TFMs, NuGet packages |
+| `decompile` | Source of NuGet/BCL symbols |
+| `find_unused` | Zero-reference symbols (with honest caveats) |
+| `analyze_impact` | "What breaks if I change this?" — speculative in-memory edit or blast radius |
+| `load_solution` / `workspace_status` / `ping` | Lifecycle & health |
+
+## Requirements
+
+- **.NET 10 SDK** (the server runs on it, and its build host loads SDK-style projects with it)
+- For **legacy .NET Framework projects**: Visual Studio 2022+ or Build Tools installed (Windows) — Roslyn's `net472` build host uses their MSBuild
+- Solutions should be **restored** (`dotnet restore`) before loading — MCPRoslyn never modifies your source or runs restore itself
+
+## Install
+
+### From source
+
+```bash
+git clone https://github.com/<you>/MCPRoslyn
+cd MCPRoslyn
+dotnet build -c Release src/McpRoslyn
+claude mcp add --scope user roslyn -- dotnet "<abs-path>/src/McpRoslyn/bin/Release/net10.0/McpRoslyn.dll"
+```
+
+### As a dotnet tool (once published to NuGet)
+
+```bash
+claude mcp add --scope user roslyn -- dnx MCPRoslyn --yes
+```
+
+For other MCP hosts (VS Code, Visual Studio, Cursor), configure a stdio server with command `dotnet` and the DLL path as the argument.
+
+On startup the server auto-discovers the solution at/above the working directory (Claude Code's project dir) and loads it in the background. Use `load_solution` to switch, `MCPROSLYN_SOLUTION=<path>` to pin, or `MCPROSLYN_AUTOLOAD=0` to disable.
+
+## What it deliberately does NOT do
+
+- **No editing, no refactoring, no shell** — read-only by construction; your agent's own tools do the writing.
+- **No file reading/grep duplicates** — your agent already has better ones; MCPRoslyn only adds what grep can't do.
+- **No embeddings/semantic search** — evidence for code is mixed; exact symbol search + your agent's grep covers most of it.
+- **Reflection/DI-container/dynamic dispatch resolution** — impossible statically; tools state this caveat instead of guessing.
+- **F# / C++** — not Roslyn languages. C# and VB.NET only.
+
+## Architecture notes
+
+- `MSBuildWorkspace` with out-of-process build hosts (Roslyn 5.6): `dotnet` on PATH loads SDK-style projects, an installed VS/Build Tools MSBuild loads legacy `.csproj`. `Microsoft.Build.Locator` is not used.
+- The workspace is an immutable snapshot; a `FileSystemWatcher` feeds edits through `Solution.WithDocumentText` lazily before each query — one file re-parse, downstream-only recompilation.
+- Multi-targeted projects load once per TFM; results are deduplicated by file+span.
+- Reference-assembly decompilation transparently falls back to the runtime implementation assembly (`System.Private.CoreLib` etc.) so BCL bodies are real, not `throw null` stubs.
+
+## License
+
+MIT
