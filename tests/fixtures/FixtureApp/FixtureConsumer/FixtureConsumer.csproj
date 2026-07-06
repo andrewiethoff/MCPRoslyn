@@ -2,6 +2,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\FixtureCore\FixtureCore.csproj" />
+    <!-- Same shared source, linked here too — compiled into a second, distinct assembly. -->
+    <Compile Include="..\Shared\SharedUtil.cs" Link="SharedUtil.cs" />
   </ItemGroup>
 
   <PropertyGroup>

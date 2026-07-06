@@ -318,7 +318,7 @@ public static class NavigationTools
         int remainingDepth, int indentLevel, int maxPerLevel, HashSet<string> visited, int budget, DateTime deadline, CancellationToken ct)
     {
         var callers = (await SymbolFinder.FindCallersAsync(target, solution, ct))
-            .GroupBy(c => c.CallingSymbol.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(c.CallingSymbol))
+            .GroupBy(c => SymbolFormat.IdentityKey(c.CallingSymbol))
             .Select(g => (Symbol: g.First().CallingSymbol,
                           Locations: g.SelectMany(x => x.Locations).Where(l => l.IsInSource).ToList(),
                           IsDirect: g.Any(x => x.IsDirect)))
@@ -348,7 +348,7 @@ public static class NavigationTools
 
             sb.AppendLine($"{indent}{SymbolFormat.KindOf(caller.Symbol)} {SymbolFormat.FqnOf(caller.Symbol)}{viaTag} — {sites}");
 
-            var key = caller.Symbol.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(caller.Symbol);
+            var key = SymbolFormat.IdentityKey(caller.Symbol);
             if (remainingDepth > 1 && visited.Add(key))
             {
                 if (DateTime.UtcNow >= deadline)
@@ -392,7 +392,7 @@ public static class NavigationTools
                 : $"[{callee.ContainingAssembly?.Name}]";
             sb.AppendLine($"{indent}{SymbolFormat.KindOf(callee)} {SymbolFormat.FqnOf(callee)} — {external}");
 
-            var key = callee.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(callee);
+            var key = SymbolFormat.IdentityKey(callee);
             if (remainingDepth > 1 && callee.Locations.Any(l => l.IsInSource) && visited.Add(key))
             {
                 if (DateTime.UtcNow >= deadline)
@@ -442,7 +442,7 @@ public static class NavigationTools
                 if (callee is null)
                     continue;
                 callee = callee.OriginalDefinition;
-                if (seen.Add(callee.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(callee)))
+                if (seen.Add(SymbolFormat.IdentityKey(callee)))
                     callees.Add(callee);
             }
         }

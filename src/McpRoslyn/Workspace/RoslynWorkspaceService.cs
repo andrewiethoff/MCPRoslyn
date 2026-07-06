@@ -51,7 +51,9 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
 
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly ConcurrentQueue<(string Path, WatcherChangeTypes Kind)> _pendingFiles = new();
-    private readonly ConcurrentDictionary<string, byte> _changedProjectFiles = new(StringComparer.OrdinalIgnoreCase);
+    // Value = UTC time the change was last observed, so a reload can drop only the entries older
+    // than its start and keep ones that arrive mid-load (a plain set would lose the latter).
+    private readonly ConcurrentDictionary<string, DateTime> _changedProjectFiles = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _readFailureRounds = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _unreadableFiles = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, bool> _implicitCompileItems = new(StringComparer.OrdinalIgnoreCase);
@@ -252,9 +254,10 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
         if (!hadSolution)
             _state = WorkspaceState.Loading;
 
-        // Project-file changes recorded before this load are covered by the fresh load itself;
-        // anything arriving DURING the load must survive it.
-        var preExistingProjectChanges = _changedProjectFiles.Keys.ToList();
+        // Project-file changes recorded before this load began are covered by the fresh load itself;
+        // anything arriving DURING the load must survive it. Compare timestamps rather than a
+        // captured key set so a same-path edit that re-fires mid-load is not silently dropped.
+        var loadStartUtc = DateTime.UtcNow;
 
         // Watch the target's directory during the load so edits made while loading are queued and
         // reconciled by the normal sync path afterwards (no dead zone). The old watchers keep
@@ -318,8 +321,9 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
                 _loadDiagnostics.AddRange(newDiagnostics);
             }
 
-            foreach (var key in preExistingProjectChanges)
-                _changedProjectFiles.TryRemove(key, out _);
+            foreach (var entry in _changedProjectFiles.ToArray())
+                if (entry.Value < loadStartUtc)
+                    _changedProjectFiles.TryRemove(entry); // atomic: keeps entries re-touched mid-load
             _readFailureRounds.Clear();
             _unreadableFiles.Clear();
 
@@ -585,7 +589,7 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
         }
         else if (BuildFileExtensions.Contains(ext, StringComparer.OrdinalIgnoreCase))
         {
-            _changedProjectFiles.TryAdd(fullPath, 0);
+            _changedProjectFiles[fullPath] = DateTime.UtcNow;
         }
     }
 
@@ -749,7 +753,7 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
                                 .OrderByDescending(p => p.FilePath!.Length)
                                 .FirstOrDefault();
                             if (nearest?.FilePath is { } projectFile)
-                                _changedProjectFiles.TryAdd(projectFile, 0);
+                                _changedProjectFiles[projectFile] = DateTime.UtcNow;
                         }
                     }
                 }

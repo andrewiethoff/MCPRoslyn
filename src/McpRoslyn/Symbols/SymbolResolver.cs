@@ -25,10 +25,14 @@ public static class SymbolResolver
         // Doc-comment ID fast path ("T:", "M:", "P:", "F:", "E:", "N:").
         if (query.Length > 2 && query[1] == ':' && "TMPFEN".Contains(query[0]))
         {
-            var byId = await ResolveDocIdAsync(solution, query, ct).ConfigureAwait(false);
-            if (byId is not null)
-                return byId;
-            throw new ToolException($"Doc-comment ID '{query}' did not resolve in the loaded solution. Try search_symbols with the plain name.");
+            var byId = DedupeByIdentity(await ResolveDocIdAsync(solution, query, ct).ConfigureAwait(false));
+            return byId.Count switch
+            {
+                1 => byId[0],
+                0 => throw new ToolException(
+                    $"Doc-comment ID '{query}' did not resolve in the loaded solution. Try search_symbols with the plain name."),
+                _ => throw AmbiguousMatchError(query, byId),
+            };
         }
 
         var parsed = ParseQuery(query);
@@ -61,19 +65,26 @@ public static class SymbolResolver
                         ? " Similar declarations:\n  " + string.Join("\n  ", suggestions)
                         : " Use search_symbols to explore."));
             default:
-                // Distinct declarations that happen to share a fully-qualified name (e.g. the same
-                // type defined in two projects) also share a doc-id, so print the project and
-                // location too — that is what actually tells them apart.
-                var lines = matches.Take(10).Select(m =>
-                {
-                    var id = m.Symbol.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(m.Symbol);
-                    var where = SymbolFormat.PrimaryLocation(m.Symbol, p => p is null ? "?" : Path.GetFileName(p));
-                    return $"{id}  ({SymbolFormat.KindOf(m.Symbol)}) — project {m.Project.Name} @ {where}";
-                });
-                throw new ToolException(
-                    $"'{query}' is ambiguous — {matches.Count} matches. Address one declaration by file+line "
-                    + "(get_symbol), or narrow the name:\n  " + string.Join("\n  ", lines));
+                throw AmbiguousMatchError(query, matches);
         }
+    }
+
+    /// <summary>
+    /// Distinct declarations that share a fully-qualified name (the same type defined in two
+    /// projects, or a linked file compiled into two assemblies) also share a doc-id, so the error
+    /// prints the project and location too — that is what actually tells them apart.
+    /// </summary>
+    private static ToolException AmbiguousMatchError(string query, List<ResolvedSymbol> matches)
+    {
+        var lines = matches.Take(10).Select(m =>
+        {
+            var id = m.Symbol.GetDocumentationCommentId() ?? SymbolFormat.FqnOf(m.Symbol);
+            var where = SymbolFormat.PrimaryLocation(m.Symbol, p => p is null ? "?" : Path.GetFileName(p));
+            return $"{id}  ({SymbolFormat.KindOf(m.Symbol)}) — project {m.Project.Name} @ {where}";
+        });
+        return new ToolException(
+            $"'{query}' is ambiguous — {matches.Count} matches. Address one declaration by file+line "
+            + "(get_symbol), or narrow the name / add a project filter:\n  " + string.Join("\n  ", lines));
     }
 
     // ---------------------------------------------------------------- query parsing
@@ -338,10 +349,11 @@ public static class SymbolResolver
         Solution solution, ParsedQuery parsed, CancellationToken ct)
     {
         // Metadata names are fully qualified, so any project that can see the assembly resolves
-        // the same symbol (deduped by doc-ID anyway). Probe cheaply first: projects whose
+        // the same symbol (deduped by assembly+doc-ID anyway). Probe cheaply first: projects whose
         // compilation is already realized. Only then force compilations, stopping at the first
-        // project that yields a match — never realize the whole solution for one lookup.
-        var projects = DistinctByProjectFile(solution).ToList();
+        // project that yields a match — never realize the whole solution for one lookup. All TFM
+        // flavors are probed, so a package referenced only by a non-first framework still resolves.
+        var projects = solution.Projects.ToList();
         var realized = new List<(Project Project, Compilation Compilation)>();
         var unrealized = new List<Project>();
         foreach (var project in projects)
@@ -484,37 +496,52 @@ public static class SymbolResolver
         }
     }
 
-    private static async Task<ResolvedSymbol?> ResolveDocIdAsync(Solution solution, string docId, CancellationToken ct)
+    private static async Task<List<ResolvedSymbol>> ResolveDocIdAsync(Solution solution, string docId, CancellationToken ct)
     {
-        // Doc-IDs are this server's own re-query currency (ambiguity errors print them), so this
-        // is a hot path: probe already-realized compilations first — the fuzzy pass that produced
-        // the doc-ID usually realized the right one — before forcing any compilation.
-        var projects = DistinctByProjectFile(solution).ToList();
+        // Doc-IDs are this server's own re-query currency (ambiguity errors print them). Probe every
+        // realized compilation first (cheap; a warm workspace needs no forcing), collecting each
+        // distinct match — a source doc-id can legitimately answer in several projects (a shared
+        // file compiled into two assemblies, or two projects sharing an FQN), and those must surface
+        // as ambiguity rather than an arbitrary silent pick.
+        var results = new List<ResolvedSymbol>();
+        var seen = new HashSet<string>();
+        var foundSource = false;
+
+        void Probe(Compilation compilation, Project project)
+        {
+            var symbol = DocumentationCommentId.GetFirstSymbolForDeclarationId(docId, compilation);
+            if (symbol is null)
+                return;
+            if (seen.Add(SymbolFormat.IdentityKey(symbol)))
+                results.Add(new ResolvedSymbol(symbol, project));
+            if (symbol.Locations.Any(l => l.IsInSource))
+                foundSource = true;
+        }
+
         var unrealized = new List<Project>();
-
-        foreach (var project in projects)
+        foreach (var project in solution.Projects)
         {
             ct.ThrowIfCancellationRequested();
-            if (!project.TryGetCompilation(out var compilation))
-            {
+            if (project.TryGetCompilation(out var compilation))
+                Probe(compilation, project);
+            else
                 unrealized.Add(project);
-                continue;
-            }
-            var symbol = DocumentationCommentId.GetFirstSymbolForDeclarationId(docId, compilation);
-            if (symbol is not null)
-                return new ResolvedSymbol(symbol, project);
         }
 
-        foreach (var project in unrealized.OrderByDescending(p => p.MetadataReferences.Count))
+        // A metadata-only answer is identical wherever it resolves (same assembly identity dedupes),
+        // so a realized metadata hit needs no forcing. Otherwise force the rest — to find the symbol
+        // at all, or to catch a same-FQN source duplicate hiding in an unrealized project.
+        if (results.Count == 0 || foundSource)
         {
-            ct.ThrowIfCancellationRequested();
-            var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
-            if (compilation is null)
-                continue;
-            var symbol = DocumentationCommentId.GetFirstSymbolForDeclarationId(docId, compilation);
-            if (symbol is not null)
-                return new ResolvedSymbol(symbol, project);
+            foreach (var project in unrealized.OrderByDescending(p => p.MetadataReferences.Count))
+            {
+                ct.ThrowIfCancellationRequested();
+                var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
+                if (compilation is not null)
+                    Probe(compilation, project);
+            }
         }
-        return null;
+
+        return results;
     }
 }

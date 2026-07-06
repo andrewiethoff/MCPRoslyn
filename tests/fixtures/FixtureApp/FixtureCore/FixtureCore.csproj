@@ -6,4 +6,9 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Shared/linked source compiled into this assembly and FixtureConsumer's. -->
+    <Compile Include="..\Shared\SharedUtil.cs" Link="SharedUtil.cs" />
+  </ItemGroup>
+
 </Project>

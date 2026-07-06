@@ -46,13 +46,20 @@ public static class AnalysisTools
             if (target is { Length: > 0 } &&
                 (target.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) || target.EndsWith(".vb", StringComparison.OrdinalIgnoreCase)))
             {
-                var document = ToolHelpers.FindDocument(solution, workspace, target);
-                var semanticModel = await document.GetSemanticModelAsync(ct)
-                    ?? throw new ToolException("No semantic model for this file.");
-                diagnostics.AddRange(semanticModel.GetDiagnostics(cancellationToken: ct));
-                scopeDescription = workspace.RelPath(document.FilePath);
-                if (include_analyzers)
-                    diagnostics.AddRange(await DocumentAnalyzerDiagnosticsAsync(document, semanticModel, ct));
+                // Every TFM flavor of the file — a diagnostic can be framework-specific. Duplicates
+                // across flavors collapse in the DiagnosticKey dedupe below.
+                var documents = ToolHelpers.FindAllDocuments(solution, workspace, target);
+                foreach (var document in documents)
+                {
+                    var semanticModel = await document.GetSemanticModelAsync(ct)
+                        ?? throw new ToolException("No semantic model for this file.");
+                    diagnostics.AddRange(semanticModel.GetDiagnostics(cancellationToken: ct));
+                    if (include_analyzers)
+                        diagnostics.AddRange(await DocumentAnalyzerDiagnosticsAsync(document, semanticModel, ct));
+                }
+                scopeDescription = documents.Count > 1
+                    ? $"{workspace.RelPath(documents[0].FilePath)} (all {documents.Count} target frameworks)"
+                    : workspace.RelPath(documents[0].FilePath);
             }
             else if (target is { Length: > 0 })
             {
@@ -351,28 +358,40 @@ public static class AnalysisTools
             var candidates = new List<ISymbol>();
             string scopeDescription;
 
+            // Dedupe candidates across TFM flavors by identity so a symbol is neither checked twice
+            // nor missed when it exists only under a non-first framework.
+            var seenKeys = new HashSet<string>();
+            void AddCandidates(IEnumerable<ISymbol> symbols)
+            {
+                foreach (var symbol in symbols)
+                    if (seenKeys.Add(SymbolFormat.IdentityKey(symbol)))
+                        candidates.Add(symbol);
+            }
+
             if (target is null or "")
             {
-                // Stop collecting once the cap is exceeded — don't force compilations of projects
-                // whose candidates would be discarded anyway. Report which projects were covered.
-                var projects = SymbolResolver.DistinctByProjectFile(solution).ToList();
-                var covered = new List<string>();
-                foreach (var project in projects)
+                // Iterate every flavor but stop once the cap is exceeded — don't force compilations
+                // whose candidates would be discarded anyway. Report which logical projects were covered.
+                var totalProjects = solution.Projects
+                    .Select(p => p.FilePath ?? p.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+                var covered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var project in solution.Projects)
                 {
                     if (candidates.Count > maxChecked)
                         break;
-                    candidates.AddRange(await CollectCandidatesAsync(project, include_public, ct));
+                    AddCandidates(await CollectCandidatesAsync(project, include_public, ct));
                     covered.Add(StripTfm(project.Name));
                 }
-                scopeDescription = covered.Count < projects.Count
-                    ? $"solution (cap reached after {covered.Count} of {projects.Count} projects: {string.Join(", ", covered)} — pass a project name to scan the rest)"
+                scopeDescription = covered.Count < totalProjects
+                    ? $"solution (cap reached after {covered.Count} of {totalProjects} projects: {string.Join(", ", covered)} — pass a project name to scan the rest)"
                     : "solution";
             }
             else if (solution.Projects.Any(p => p.Name.Contains(target, StringComparison.OrdinalIgnoreCase)))
             {
                 var project = ToolHelpers.FindProject(solution, target);
-                candidates.AddRange(await CollectCandidatesAsync(project, include_public, ct));
-                scopeDescription = $"project {project.Name}";
+                foreach (var flavor in AllTfmFlavors(solution, project))
+                    AddCandidates(await CollectCandidatesAsync(flavor, include_public, ct));
+                scopeDescription = $"project {StripTfm(project.Name)}";
             }
             else
             {

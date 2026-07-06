@@ -47,11 +47,13 @@ public static class SymbolFormat
 
     /// <summary>
     /// Stable identity key that collapses genuine duplicates while keeping distinct declarations
-    /// apart. Source symbols key on their declaration file+span set, so a symbol seen once per
-    /// multi-target TFM flavor (same file, same span) collapses to one, but two different projects
-    /// declaring the same fully-qualified name stay separate. Metadata symbols key on the
-    /// containing assembly's identity plus documentation id, so the same referenced assembly
-    /// reached through several projects collapses while different assembly versions do not.
+    /// apart. Source symbols key on the containing assembly's simple name plus their declaration
+    /// file+span set: a symbol seen once per multi-target TFM flavor shares an assembly name and the
+    /// same spans, so it collapses; but a linked/shared file compiled into two different assemblies
+    /// (or two projects declaring the same fully-qualified name) has a different assembly name and
+    /// stays separate. Metadata symbols key on the containing assembly's identity plus documentation
+    /// id, so the same referenced assembly reached through several projects collapses while
+    /// different assembly versions do not.
     /// </summary>
     public static string IdentityKey(ISymbol symbol)
     {
@@ -61,7 +63,7 @@ public static class SymbolFormat
             .OrderBy(s => s, StringComparer.Ordinal)
             .ToList();
         if (sourceSpans.Count > 0)
-            return "S|" + string.Join(";", sourceSpans);
+            return "S|" + (symbol.ContainingAssembly?.Name ?? "?") + "|" + string.Join(";", sourceSpans);
 
         var assembly = symbol.ContainingAssembly?.Identity.GetDisplayName() ?? "?";
         return "M|" + assembly + "|" + (symbol.GetDocumentationCommentId() ?? FqnOf(symbol) + symbol.Kind);

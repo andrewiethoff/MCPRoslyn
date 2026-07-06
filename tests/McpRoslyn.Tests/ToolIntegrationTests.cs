@@ -281,4 +281,25 @@ public class ToolIntegrationTests(FixtureWorkspace fixture)
         Assert.Contains("✖", output);
         Assert.Contains("CS0219", output);
     }
+
+    [Fact]
+    public async Task GetSymbol_LinkedFileInTwoProjects_IsAmbiguousNotCollapsed()
+    {
+        // Shared.SharedUtil is a linked file compiled into both FixtureCore and FixtureConsumer.
+        // They share a file+span but are distinct assemblies, so resolution must NOT collapse them.
+        var output = await SearchTools.GetSymbol(Ws, Lf, Ct, symbol: "Shared.SharedUtil");
+        Assert.StartsWith("ERROR:", output);
+        Assert.Contains("ambiguous", output);
+        Assert.Contains("FixtureCore", output);
+        Assert.Contains("FixtureConsumer", output);
+    }
+
+    [Fact]
+    public async Task GetSymbol_LinkedFileDocIdIsAlsoAmbiguous()
+    {
+        // The doc-ID fast path must disambiguate too, not silently pick the first project visited.
+        var output = await SearchTools.GetSymbol(Ws, Lf, Ct, symbol: "T:Shared.SharedUtil");
+        Assert.StartsWith("ERROR:", output);
+        Assert.Contains("ambiguous", output);
+    }
 }
