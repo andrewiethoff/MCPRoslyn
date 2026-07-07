@@ -32,7 +32,7 @@ Each option gives you a **command + arguments** that you drop into a harness's M
 
 ### Option A — Run from NuGet with `dnx` (recommended, no install)
 
-Once the package is published to nuget.org, nothing to install — `dnx` downloads and runs it:
+Nothing to install — `dnx` downloads and runs the package from nuget.org:
 
 ```bash
 dnx MCPRoslyn --yes
@@ -58,7 +58,7 @@ This creates a command named **`mcp-roslyn`** on your PATH. The executable lives
 
 - **command:** `mcp-roslyn`  **args:** _(none)_
 
-### Option C — Build from source (works today, before the NuGet publish)
+### Option C — Build from source (for development or unreleased changes)
 
 ```bash
 git clone https://github.com/andrewiethoff/MCPRoslyn
