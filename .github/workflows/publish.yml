@@ -1,0 +1,56 @@
+name: Publish to NuGet
+
+# Publishes MCPRoslyn to nuget.org using Trusted Publishing (OIDC) — no stored API key.
+# Requires a matching Trusted Publishing policy on nuget.org (Repository Owner: andrewiethoff,
+# Repository: MCPRoslyn, Workflow File: publish.yml) and a repo secret NUGET_USER = your
+# nuget.org profile name (not your email).
+
+on:
+  release:
+    types: [published]        # cut a GitHub Release tagged e.g. v0.1.0 -> publishes package 0.1.0
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version to publish (e.g. 0.1.0)"
+        required: true
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    environment: release       # remove if your nuget policy left the Environment field empty
+    permissions:
+      id-token: write          # required to mint the OIDC token
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Determine version
+        id: v
+        shell: pwsh
+        run: |
+          $ver = if ($env:GITHUB_EVENT_NAME -eq 'release') { "${{ github.event.release.tag_name }}".TrimStart('v') } else { "${{ github.event.inputs.version }}" }
+          if ([string]::IsNullOrWhiteSpace($ver)) { throw "Could not determine version." }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          Write-Host "Publishing version $ver"
+
+      - name: Build
+        run: dotnet build MCPRoslyn.slnx -c Release -p:Version=${{ steps.v.outputs.version }}
+
+      - name: Test
+        run: dotnet test MCPRoslyn.slnx -c Release --no-build
+
+      - name: Pack
+        run: dotnet pack src/McpRoslyn/McpRoslyn.csproj -c Release --no-build -o artifacts -p:Version=${{ steps.v.outputs.version }}
+
+      - name: NuGet login (OIDC -> short-lived API key)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Push
+        run: dotnet nuget push artifacts/*.nupkg --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json

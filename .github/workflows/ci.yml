@@ -1,0 +1,26 @@
+name: CI
+
+# Build + test on every push to main and every PR, so commits get a green check and the
+# publish path (windows-latest, .NET 10) is continuously exercised before a release.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build
+        run: dotnet build MCPRoslyn.slnx -c Release
+
+      - name: Test
+        run: dotnet test MCPRoslyn.slnx -c Release --no-build
