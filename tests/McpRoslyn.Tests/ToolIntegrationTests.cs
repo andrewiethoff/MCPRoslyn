@@ -331,12 +331,21 @@ public class ToolIntegrationTests(FixtureWorkspace fixture)
     }
 
     [Fact]
-    public async Task FindReferences_ProjectHintResolvesAmbiguousTarget()
+    public async Task FindReferences_InlineHintResolvesAmbiguousTarget()
     {
-        // Without a discriminator this would be an ambiguity error; the project filter resolves it.
-        var output = await NavigationTools.FindReferences(Ws, Lf, Ct, "Shared.SharedUtil", project: "FixtureCore");
+        // Target disambiguation is the inline @hint (the project arg is only a location filter, so
+        // it can never hide cross-project usages). Without the hint this would be an ambiguity error.
+        var output = await NavigationTools.FindReferences(Ws, Lf, Ct, "Shared.SharedUtil@FixtureCore");
         Assert.DoesNotContain("ambiguous", output);
         Assert.Contains("SharedUtil", output);
+    }
+
+    [Fact]
+    public async Task TypeHierarchy_RejectsInvalidDirection()
+    {
+        var output = await NavigationTools.GetTypeHierarchy(Ws, Lf, Ct, "ShapeBase", direction: "sideways");
+        Assert.StartsWith("ERROR:", output);
+        Assert.Contains("up|down|both", output);
     }
 
     [Fact]

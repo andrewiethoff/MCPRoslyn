@@ -793,9 +793,11 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
     /// <summary>
     /// True when a project uses SDK-style implicit compile globbing (so a source file appearing in
     /// its directory really does become part of it). False for legacy non-SDK projects with explicit
-    /// Compile items, and for SDK projects that set EnableDefaultCompileItems/EnableDefaultItems to
-    /// false. When we cannot tell, we answer false and require a deliberate reload — never guess a
-    /// file into the wrong project. Cached per project file; the cache is cleared on every load.
+    /// Compile items, for SDK projects that set EnableDefaultCompileItems/EnableDefaultItems to false
+    /// or narrow the glob with a Compile Remove — including when those come from an imported
+    /// Directory.Build.props/.targets rather than the csproj itself. When we cannot tell, we answer
+    /// false and require a deliberate reload — never guess a file into the wrong project. Cached per
+    /// project file; the cache is cleared on every load.
     /// </summary>
     private bool ProjectImplicitlyIncludesSources(string projectFilePath) =>
         _implicitCompileItems.GetOrAdd(projectFilePath, static path =>
@@ -812,24 +814,59 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
                 if (!isSdkStyle)
                     return false;
 
-                var defaultsDisabled = root.Descendants()
-                    .Where(e => e.Name.LocalName is "EnableDefaultCompileItems" or "EnableDefaultItems")
-                    .Any(e => string.Equals(e.Value.Trim(), "false", StringComparison.OrdinalIgnoreCase));
-                if (defaultsDisabled)
-                    return false;
-
-                // A <Compile Remove .../> narrows the implicit glob, so a file in the directory is
-                // not necessarily compiled. Be conservative and require a deliberate reload rather
-                // than materialize a document the real build would exclude.
-                var narrowsCompileItems = root.Descendants()
-                    .Any(e => e.Name.LocalName == "Compile" && e.Attribute("Remove") is not null);
-                return !narrowsCompileItems;
+                // The csproj plus the nearest auto-imported Directory.Build.props/.targets can each
+                // disable default compile items or narrow the glob.
+                foreach (var buildFile in CompileAffectingFiles(path))
+                    if (DisablesImplicitCompile(buildFile))
+                        return false;
+                return true;
             }
             catch
             {
                 return false;
             }
         });
+
+    /// <summary>The project file itself plus the nearest ancestor Directory.Build.props and .targets
+    /// (the ones MSBuild auto-imports).</summary>
+    private static IEnumerable<string> CompileAffectingFiles(string projectFilePath)
+    {
+        yield return projectFilePath;
+
+        string? props = null, targets = null;
+        var dir = Path.GetDirectoryName(projectFilePath);
+        for (var levels = 0; dir is not null && levels < 24 && (props is null || targets is null); levels++)
+        {
+            if (props is null && File.Exists(Path.Combine(dir, "Directory.Build.props")))
+                props = Path.Combine(dir, "Directory.Build.props");
+            if (targets is null && File.Exists(Path.Combine(dir, "Directory.Build.targets")))
+                targets = Path.Combine(dir, "Directory.Build.targets");
+            dir = Path.GetDirectoryName(dir);
+        }
+        if (props is not null)
+            yield return props;
+        if (targets is not null)
+            yield return targets;
+    }
+
+    /// <summary>True if a build file disables default compile items or narrows the compile glob.</summary>
+    private static bool DisablesImplicitCompile(string buildFilePath)
+    {
+        try
+        {
+            var doc = XDocument.Load(buildFilePath);
+            var defaultsDisabled = doc.Descendants()
+                .Where(e => e.Name.LocalName is "EnableDefaultCompileItems" or "EnableDefaultItems")
+                .Any(e => string.Equals(e.Value.Trim(), "false", StringComparison.OrdinalIgnoreCase));
+            var narrows = doc.Descendants()
+                .Any(e => e.Name.LocalName == "Compile" && e.Attribute("Remove") is not null);
+            return defaultsDisabled || narrows;
+        }
+        catch
+        {
+            return true; // unreadable → assume it might affect membership; stay conservative
+        }
+    }
 
     private static async Task<SourceText?> TryReadFileAsync(string path, CancellationToken ct)
     {

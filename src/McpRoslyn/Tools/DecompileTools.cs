@@ -41,9 +41,9 @@ public static class DecompileTools
                         text = text[..20_000] + "\n… truncated — read the file for the rest.";
                     sb.AppendLine(text);
                 }
-                return sb.ToString().TrimEnd();
+                return ToolHelpers.WithStaleNotice(sb.ToString().TrimEnd(), workspace);
             }
 
-            return await decompiler.DecompileAsync(resolved, ct);
+            return ToolHelpers.WithStaleNotice(await decompiler.DecompileAsync(resolved, ct), workspace);
         });
 }

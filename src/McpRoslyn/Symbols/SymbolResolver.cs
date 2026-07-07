@@ -30,7 +30,7 @@ public static class SymbolResolver
         // Doc-comment ID fast path ("T:", "M:", "P:", "F:", "E:", "N:").
         if (query.Length > 2 && query[1] == ':' && "TMPFEN".Contains(query[0]))
         {
-            var byId = NarrowByProject(DedupeByIdentity(await ResolveDocIdAsync(solution, query, ct).ConfigureAwait(false)), projectHint);
+            var byId = NarrowByProject(DedupeByIdentity(await ResolveDocIdAsync(solution, query, projectHint, ct).ConfigureAwait(false)), projectHint);
             return byId.Count switch
             {
                 1 => byId[0],
@@ -44,7 +44,7 @@ public static class SymbolResolver
         var matches = await FindSourceMatchesAsync(solution, parsed, ct).ConfigureAwait(false);
 
         if (matches.Count == 0)
-            matches = await FindMetadataMatchesAsync(solution, parsed, ct).ConfigureAwait(false);
+            matches = await FindMetadataMatchesAsync(solution, parsed, projectHint, ct).ConfigureAwait(false);
 
         // Prefer exact-name matches over case-insensitive ones when both exist.
         if (matches.Count > 1)
@@ -100,12 +100,14 @@ public static class SymbolResolver
     {
         if (matches.Count <= 1 || string.IsNullOrWhiteSpace(projectHint))
             return matches;
-        var narrowed = matches
-            .Where(m => m.Project.Name.Contains(projectHint, StringComparison.OrdinalIgnoreCase)
-                        || m.Symbol.ContainingAssembly?.Name.Contains(projectHint, StringComparison.OrdinalIgnoreCase) == true)
-            .ToList();
+        var narrowed = matches.Where(m => MatchesHint(m.Project, m.Symbol, projectHint)).ToList();
         return narrowed.Count > 0 ? narrowed : matches;
     }
+
+    private static bool MatchesHint(Project project, ISymbol symbol, string? hint) =>
+        string.IsNullOrWhiteSpace(hint)
+        || project.Name.Contains(hint, StringComparison.OrdinalIgnoreCase)
+        || symbol.ContainingAssembly?.Name.Contains(hint, StringComparison.OrdinalIgnoreCase) == true;
 
     /// <summary>Splits a trailing 'Name@ProjectHint' discriminator off a query (top level only, and
     /// not a leading verbatim-identifier '@'). Returns the bare query and the hint (or null).</summary>
@@ -401,17 +403,18 @@ public static class SymbolResolver
     // ---------------------------------------------------------------- metadata resolution
 
     private static async Task<List<ResolvedSymbol>> FindMetadataMatchesAsync(
-        Solution solution, ParsedQuery parsed, CancellationToken ct)
+        Solution solution, ParsedQuery parsed, string? projectHint, CancellationToken ct)
     {
         // Metadata names are fully qualified, so any project that can see the assembly resolves
-        // the same symbol (deduped by assembly+doc-ID anyway). Probe cheaply first: projects whose
-        // compilation is already realized. Only then force compilations, stopping at the first
-        // project that yields a match — never realize the whole solution for one lookup. All TFM
-        // flavors are probed, so a package referenced only by a non-first framework still resolves.
-        var projects = solution.Projects.ToList();
+        // the same symbol (deduped by assembly identity + doc-ID). Probe cheaply first: projects
+        // whose compilation is already realized. Only then force compilations, stopping once a match
+        // is found — never realize the whole solution for one lookup. All TFM flavors are probed, so
+        // a package referenced only by a non-first framework still resolves; and when a project hint
+        // is given, hinted projects are probed first and forcing continues until a hinted match is
+        // found so different-version assemblies do not resolve to the wrong project.
         var realized = new List<(Project Project, Compilation Compilation)>();
         var unrealized = new List<Project>();
-        foreach (var project in projects)
+        foreach (var project in solution.Projects)
         {
             if (project.TryGetCompilation(out var compilation))
                 realized.Add((project, compilation));
@@ -421,24 +424,27 @@ public static class SymbolResolver
 
         var results = new List<ResolvedSymbol>();
         var seenAssemblies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        bool HintSatisfied() => results.Count > 0 && results.Any(r => MatchesHint(r.Project, r.Symbol, projectHint));
 
         foreach (var (project, compilation) in realized)
         {
             ct.ThrowIfCancellationRequested();
             ProbeCompilation(compilation, project, parsed, results, seenAssemblies);
         }
-        if (results.Count > 0)
+        if (HintSatisfied())
             return results;
 
-        // Bigger reference closures first: they can see the most assemblies.
-        foreach (var project in unrealized.OrderByDescending(p => p.MetadataReferences.Count))
+        // Hinted projects first, then bigger reference closures (they see the most assemblies).
+        foreach (var project in unrealized
+                     .OrderByDescending(p => p.Name.Contains(projectHint ?? "\0", StringComparison.OrdinalIgnoreCase))
+                     .ThenByDescending(p => p.MetadataReferences.Count))
         {
             ct.ThrowIfCancellationRequested();
             var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
             if (compilation is null)
                 continue;
             ProbeCompilation(compilation, project, parsed, results, seenAssemblies);
-            if (results.Count > 0)
+            if (HintSatisfied())
                 return results;
         }
 
@@ -556,7 +562,7 @@ public static class SymbolResolver
         }
     }
 
-    private static async Task<List<ResolvedSymbol>> ResolveDocIdAsync(Solution solution, string docId, CancellationToken ct)
+    private static async Task<List<ResolvedSymbol>> ResolveDocIdAsync(Solution solution, string docId, string? projectHint, CancellationToken ct)
     {
         // Doc-IDs are this server's own re-query currency (ambiguity errors print them). Probe every
         // realized compilation first (cheap; a warm workspace needs no forcing), collecting each
@@ -588,17 +594,25 @@ public static class SymbolResolver
                 unrealized.Add(project);
         }
 
+        bool HintSatisfied() => string.IsNullOrWhiteSpace(projectHint)
+            || results.Any(r => MatchesHint(r.Project, r.Symbol, projectHint));
+
         // A metadata-only answer is identical wherever it resolves (same assembly identity dedupes),
-        // so a realized metadata hit needs no forcing. Otherwise force the rest — to find the symbol
-        // at all, or to catch a same-FQN source duplicate hiding in an unrealized project.
-        if (results.Count == 0 || foundSource)
+        // so a realized metadata hit needs no forcing — unless a hint has not yet been satisfied
+        // (different-version assembly in an unrealized project). Force the rest to find the symbol
+        // at all, catch a same-FQN source duplicate, or reach the hinted assembly; hinted first.
+        if (results.Count == 0 || foundSource || !HintSatisfied())
         {
-            foreach (var project in unrealized.OrderByDescending(p => p.MetadataReferences.Count))
+            foreach (var project in unrealized
+                         .OrderByDescending(p => p.Name.Contains(projectHint ?? "\0", StringComparison.OrdinalIgnoreCase))
+                         .ThenByDescending(p => p.MetadataReferences.Count))
             {
                 ct.ThrowIfCancellationRequested();
                 var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
                 if (compilation is not null)
                     Probe(compilation, project);
+                if (!foundSource && HintSatisfied() && results.Count > 0)
+                    break; // hinted metadata match found; no need to force the remaining projects
             }
         }
 

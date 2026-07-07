@@ -25,7 +25,7 @@ public static class NavigationTools
         CancellationToken ct,
         [Description("Symbol name, e.g. 'OrderService.Process' or a doc-ID from a previous result.")]
         string symbol,
-        [Description("Only references inside projects whose name contains this.")]
+        [Description("Only report references located inside projects whose name contains this (a location filter, not target disambiguation). To pick which declaration of an ambiguous/linked symbol to search for, put it in the symbol as 'Name@ProjectName'.")]
         string? project = null,
         [Description("Include the source line of each reference (default true; false saves tokens).")]
         bool include_snippets = true,
@@ -36,9 +36,10 @@ public static class NavigationTools
         => ToolRunner.Run(loggerFactory.CreateLogger("mcp-roslyn"), "find_references", async () =>
         {
             var solution = await workspace.GetSolutionAsync(ct);
-            // project is a resolution tie-breaker only when the symbol is ambiguous (same FQN in two
-            // projects / a linked file); for an unambiguous symbol it just filters the locations below.
-            var resolved = await SymbolResolver.ResolveOrThrowAsync(solution, symbol, ct, project);
+            // Target disambiguation is the inline 'Name@ProjectName' hint (parsed in resolution).
+            // The `project` argument is purely a reference-location filter (below), so it never
+            // hides usages in other projects when it was only meant to pick the declaration.
+            var resolved = await SymbolResolver.ResolveOrThrowAsync(solution, symbol, ct);
             var target = resolved.Symbol;
 
             var referencedSymbols = await SymbolFinder.FindReferencesAsync(target, solution, ct);
@@ -223,6 +224,9 @@ public static class NavigationTools
                 throw new ToolException($"{SymbolFormat.FqnOf(resolved.Symbol)} is a {SymbolFormat.KindOf(resolved.Symbol)}, not a type.");
 
             var dir = direction.Trim().ToLowerInvariant();
+            if (dir is not ("up" or "down" or "both"))
+                throw new ToolException($"Unknown direction '{direction}' — use up|down|both.");
+
             var sb = new StringBuilder();
             sb.AppendLine($"{SymbolFormat.KindOf(type)} {SymbolFormat.FqnOf(type)} — {SymbolFormat.PrimaryLocation(type, workspace.RelPath)}");
 
