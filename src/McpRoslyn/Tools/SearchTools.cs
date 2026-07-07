@@ -82,6 +82,8 @@ public static class SearchTools
         string? file = null,
         [Description("1-based line number in 'file'.")]
         int? line = null,
+        [Description("Disambiguate a symbol/file that exists in multiple projects (a linked/shared file, or the same FQN in two projects) by a substring of the project name. Also expressible inline as 'Name@ProjectName'.")]
+        string? project = null,
         [Description("Include the full member list for types (default true).")]
         bool include_members = true,
         [Description("Include full docs: parameters, returns, remarks, exceptions (default: summary only).")]
@@ -93,12 +95,12 @@ public static class SearchTools
             ISymbol target;
             if (symbol is { Length: > 0 })
             {
-                var resolved = await SymbolResolver.ResolveOrThrowAsync(solution, symbol, ct);
+                var resolved = await SymbolResolver.ResolveOrThrowAsync(solution, symbol, ct, project);
                 target = resolved.Symbol;
             }
             else if (file is { Length: > 0 } && line is { } lineNumber)
             {
-                target = await SymbolAtLineAsync(solution, workspace, file, lineNumber, ct);
+                target = await SymbolAtLineAsync(solution, workspace, file, lineNumber, project, ct);
             }
             else
             {
@@ -110,9 +112,30 @@ public static class SearchTools
         });
 
     private static async Task<ISymbol> SymbolAtLineAsync(
-        Solution solution, RoslynWorkspaceService workspace, string file, int line, CancellationToken ct)
+        Solution solution, RoslynWorkspaceService workspace, string file, int line, string? project, CancellationToken ct)
     {
-        var document = ToolHelpers.FindDocument(solution, workspace, file);
+        // A linked/shared file is compiled into several logical projects, so the declaration at a
+        // line exists in each. Narrow by project if asked; otherwise report the ambiguity rather
+        // than silently picking whichever project comes first.
+        var documents = ToolHelpers.FindAllDocuments(solution, workspace, file);
+        var byProject = documents
+            .GroupBy(d => d.Project.FilePath ?? d.Project.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (byProject.Count > 1 && project is { Length: > 0 })
+        {
+            var matched = byProject
+                .Where(g => g.First().Project.Name.Contains(project, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (matched.Count == 1)
+                byProject = matched;
+        }
+        if (byProject.Count > 1)
+            throw new ToolException(
+                $"{workspace.RelPath(documents[0].FilePath)} is compiled into {byProject.Count} projects "
+                + $"({string.Join(", ", byProject.Select(g => g.First().Project.Name))}). "
+                + "Pass project= to pick one.");
+
+        var document = byProject[0].First();
         var text = await document.GetTextAsync(ct);
         if (line < 1 || line > text.Lines.Count)
             throw new ToolException($"Line {line} is out of range (file has {text.Lines.Count} lines).");

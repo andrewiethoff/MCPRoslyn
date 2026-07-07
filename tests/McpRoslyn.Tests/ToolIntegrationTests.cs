@@ -302,4 +302,50 @@ public class ToolIntegrationTests(FixtureWorkspace fixture)
         Assert.StartsWith("ERROR:", output);
         Assert.Contains("ambiguous", output);
     }
+
+    [Fact]
+    public async Task GetSymbol_InlineProjectHintDisambiguatesLinkedFile()
+    {
+        // 'Name@Project' picks one of the two declarations instead of erroring.
+        var core = await SearchTools.GetSymbol(Ws, Lf, Ct, symbol: "Shared.SharedUtil@FixtureCore");
+        Assert.DoesNotContain("ambiguous", core);
+        Assert.Contains("class SharedUtil", core);
+        Assert.Contains("project: FixtureCore", core);
+
+        var consumer = await SearchTools.GetSymbol(Ws, Lf, Ct, symbol: "Shared.SharedUtil", project: "FixtureConsumer");
+        Assert.DoesNotContain("ambiguous", consumer);
+        Assert.Contains("project: FixtureConsumer", consumer);
+    }
+
+    [Fact]
+    public async Task GetSymbol_FileLineOnLinkedFileIsAmbiguousThenDisambiguated()
+    {
+        // SharedUtil.cs is compiled into two projects; file+line must not silently pick one.
+        var ambiguous = await SearchTools.GetSymbol(Ws, Lf, Ct, file: "SharedUtil.cs", line: 6);
+        Assert.StartsWith("ERROR:", ambiguous);
+        Assert.Contains("compiled into 2 projects", ambiguous);
+
+        var picked = await SearchTools.GetSymbol(Ws, Lf, Ct, file: "SharedUtil.cs", line: 6, project: "FixtureCore");
+        Assert.Contains("class SharedUtil", picked);
+        Assert.Contains("project: FixtureCore", picked);
+    }
+
+    [Fact]
+    public async Task FindReferences_ProjectHintResolvesAmbiguousTarget()
+    {
+        // Without a discriminator this would be an ambiguity error; the project filter resolves it.
+        var output = await NavigationTools.FindReferences(Ws, Lf, Ct, "Shared.SharedUtil", project: "FixtureCore");
+        Assert.DoesNotContain("ambiguous", output);
+        Assert.Contains("SharedUtil", output);
+    }
+
+    [Fact]
+    public async Task FindUnused_TypeScopeFindsDeadMembers()
+    {
+        // Type scope now goes through the all-flavors source-match path.
+        var output = await AnalysisTools.FindUnused(Ws, Lf, Ct, target: "Processor");
+        Assert.Contains("type FixtureCore.Processor", output);
+        Assert.Contains("_unusedField", output);
+        Assert.Contains("UnusedHelper", output);
+    }
 }

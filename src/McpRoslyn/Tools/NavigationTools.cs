@@ -36,7 +36,9 @@ public static class NavigationTools
         => ToolRunner.Run(loggerFactory.CreateLogger("mcp-roslyn"), "find_references", async () =>
         {
             var solution = await workspace.GetSolutionAsync(ct);
-            var resolved = await SymbolResolver.ResolveOrThrowAsync(solution, symbol, ct);
+            // project is a resolution tie-breaker only when the symbol is ambiguous (same FQN in two
+            // projects / a linked file); for an unambiguous symbol it just filters the locations below.
+            var resolved = await SymbolResolver.ResolveOrThrowAsync(solution, symbol, ct, project);
             var target = resolved.Symbol;
 
             var referencedSymbols = await SymbolFinder.FindReferencesAsync(target, solution, ct);

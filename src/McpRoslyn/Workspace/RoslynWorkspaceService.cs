@@ -591,6 +591,13 @@ public sealed class RoslynWorkspaceService(ILogger<RoslynWorkspaceService> log) 
         {
             _changedProjectFiles[fullPath] = DateTime.UtcNow;
         }
+        else if (kind == WatcherChangeTypes.Deleted && ext.Length == 0)
+        {
+            // Deleting a folder emits a single delete event for the directory (no per-file events),
+            // so a folder of .cs/.vb files would otherwise stay in the snapshot. An extension-less
+            // delete is most likely a directory — reconcile by a timestamp/existence resync.
+            _resyncNeeded = true;
+        }
     }
 
     private void OnRenamed(string oldPath, string newPath)

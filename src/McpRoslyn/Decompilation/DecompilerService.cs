@@ -307,11 +307,17 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
         _ => name,
     };
 
-    /// <summary>The requested assembly, plus runtime-implementation fallbacks for reference assemblies.</summary>
+    /// <summary>The requested assembly, plus real-implementation fallbacks for reference assemblies.</summary>
     private static IEnumerable<string> CandidatePaths(string assemblyPath, bool isReferenceAssembly)
     {
         if (isReferenceAssembly)
         {
+            // NuGet packages ship reference assemblies under ref/<tfm>/; the real body lives in the
+            // sibling lib/<tfm>/ (or runtimes/<rid>/lib/<tfm>/) implementation assembly.
+            foreach (var nuget in NuGetImplementationCandidates(assemblyPath))
+                yield return nuget;
+
+            // Framework reference assemblies fall back to the shared runtime directory.
             var runtimeDir = Path.GetDirectoryName(typeof(object).Assembly.Location);
             if (runtimeDir is not null)
             {
@@ -327,6 +333,43 @@ public sealed class DecompilerService(ILogger<DecompilerService> log)
         }
 
         yield return assemblyPath;
+    }
+
+    /// <summary>
+    /// For a NuGet reference assembly at <c>.../packages/&lt;id&gt;/&lt;ver&gt;/ref/&lt;tfm&gt;/Foo.dll</c>,
+    /// yields the sibling implementation DLLs under <c>lib/</c> and <c>runtimes/*/lib/</c> when present.
+    /// </summary>
+    private static IEnumerable<string> NuGetImplementationCandidates(string refAssemblyPath)
+    {
+        var fileName = Path.GetFileName(refAssemblyPath);
+        var normalized = refAssemblyPath.Replace('/', Path.DirectorySeparatorChar);
+        var refSegment = $"{Path.DirectorySeparatorChar}ref{Path.DirectorySeparatorChar}";
+        var idx = normalized.IndexOf(refSegment, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0)
+            yield break;
+
+        var packageRoot = normalized[..idx];                        // .../<id>/<ver>
+        var tfmAndFile = normalized[(idx + refSegment.Length)..];   // <tfm>/Foo.dll
+
+        var libCandidate = Path.Combine(packageRoot, "lib", tfmAndFile);
+        if (File.Exists(libCandidate))
+            yield return libCandidate;
+
+        var runtimesDir = Path.Combine(packageRoot, "runtimes");
+        List<string> runtimeHits = [];
+        if (Directory.Exists(runtimesDir))
+        {
+            try
+            {
+                runtimeHits = Directory.EnumerateFiles(runtimesDir, fileName, SearchOption.AllDirectories).ToList();
+            }
+            catch
+            {
+                // Best-effort: an unreadable runtimes tree just means no extra candidates.
+            }
+        }
+        foreach (var hit in runtimeHits)
+            yield return hit;
     }
 
     private static string ReflectionName(INamedTypeSymbol type)

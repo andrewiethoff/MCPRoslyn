@@ -395,24 +395,35 @@ public static class AnalysisTools
             }
             else
             {
-                var resolved = await SymbolResolver.ResolveOrThrowAsync(solution, target, ct);
-                switch (resolved.Symbol)
+                // Every source declaration matching the name across all project flavors, so a
+                // multi-TFM type contributes each flavor's members and a same-named namespace in
+                // several projects is fully scanned. AddCandidates dedupes by identity.
+                var matches = await SymbolResolver.FindAllSourceMatchesAsync(solution, target, ct);
+                var types = matches.Select(m => m.Symbol).OfType<INamedTypeSymbol>().ToList();
+                var namespaces = matches.Select(m => m.Symbol).OfType<INamespaceSymbol>().ToList();
+
+                if (types.Count > 0)
                 {
-                    case INamedTypeSymbol type:
-                        candidates.AddRange(FilterCandidates(type.GetMembers(), include_public));
-                        scopeDescription = $"type {SymbolFormat.FqnOf(type)}";
-                        break;
-                    case INamespaceSymbol ns:
+                    foreach (var type in types)
+                        AddCandidates(FilterCandidates(type.GetMembers(), include_public));
+                    scopeDescription = $"type {SymbolFormat.FqnOf(types[0])}";
+                }
+                else if (namespaces.Count > 0)
+                {
+                    foreach (var ns in namespaces)
                         foreach (var type in AllTypes(ns).Where(t => t.Locations.Any(l => l.IsInSource)))
                         {
                             if (include_public || type.DeclaredAccessibility != Accessibility.Public)
-                                candidates.Add(type);
-                            candidates.AddRange(FilterCandidates(type.GetMembers(), include_public));
+                                AddCandidates([type]);
+                            AddCandidates(FilterCandidates(type.GetMembers(), include_public));
                         }
-                        scopeDescription = $"namespace {target}";
-                        break;
-                    default:
-                        throw new ToolException($"'{target}' is a {SymbolFormat.KindOf(resolved.Symbol)} — pass a project, namespace or type.");
+                    scopeDescription = $"namespace {target}";
+                }
+                else
+                {
+                    // Not a type or namespace — resolve once for a precise, teaching error.
+                    var resolved = await SymbolResolver.ResolveOrThrowAsync(solution, target, ct);
+                    throw new ToolException($"'{target}' is a {SymbolFormat.KindOf(resolved.Symbol)} — pass a project, namespace or type.");
                 }
             }
 

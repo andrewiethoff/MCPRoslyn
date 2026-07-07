@@ -15,17 +15,22 @@ public sealed record ResolvedSymbol(ISymbol Symbol, Project Project);
 /// </summary>
 public static class SymbolResolver
 {
-    public static async Task<ResolvedSymbol> ResolveOrThrowAsync(Solution solution, string query, CancellationToken ct)
+    public static async Task<ResolvedSymbol> ResolveOrThrowAsync(
+        Solution solution, string query, CancellationToken ct, string? projectHint = null)
     {
         if (string.IsNullOrWhiteSpace(query))
             throw new ToolException("Empty symbol name. Pass a (fuzzy) fully-qualified name like 'MyApp.OrderService.Process'.");
 
         query = query.Trim();
+        // An inline 'Name@ProjectHint' suffix disambiguates same-FQN declarations (linked file /
+        // two projects) and overrides an explicit hint argument.
+        (query, var inlineHint) = SplitProjectHint(query);
+        projectHint = inlineHint ?? projectHint;
 
         // Doc-comment ID fast path ("T:", "M:", "P:", "F:", "E:", "N:").
         if (query.Length > 2 && query[1] == ':' && "TMPFEN".Contains(query[0]))
         {
-            var byId = DedupeByIdentity(await ResolveDocIdAsync(solution, query, ct).ConfigureAwait(false));
+            var byId = NarrowByProject(DedupeByIdentity(await ResolveDocIdAsync(solution, query, ct).ConfigureAwait(false)), projectHint);
             return byId.Count switch
             {
                 1 => byId[0],
@@ -51,7 +56,7 @@ public static class SymbolResolver
                 matches = exact;
         }
 
-        matches = DedupeByIdentity(matches);
+        matches = NarrowByProject(DedupeByIdentity(matches), projectHint);
 
         switch (matches.Count)
         {
@@ -83,8 +88,58 @@ public static class SymbolResolver
             return $"{id}  ({SymbolFormat.KindOf(m.Symbol)}) — project {m.Project.Name} @ {where}";
         });
         return new ToolException(
-            $"'{query}' is ambiguous — {matches.Count} matches. Address one declaration by file+line "
-            + "(get_symbol), or narrow the name / add a project filter:\n  " + string.Join("\n  ", lines));
+            $"'{query}' is ambiguous — {matches.Count} matches. Re-query with a project discriminator "
+            + "(append '@<projectName>', or pass project= where the tool accepts it), or address one "
+            + "declaration by file+line (get_symbol):\n  " + string.Join("\n  ", lines));
+    }
+
+    /// <summary>When ambiguous and a hint is given, keep only matches in a project (or assembly)
+    /// whose name contains the hint; if that eliminates everything, keep all so the ambiguity is
+    /// still reported rather than turned into a spurious not-found.</summary>
+    private static List<ResolvedSymbol> NarrowByProject(List<ResolvedSymbol> matches, string? projectHint)
+    {
+        if (matches.Count <= 1 || string.IsNullOrWhiteSpace(projectHint))
+            return matches;
+        var narrowed = matches
+            .Where(m => m.Project.Name.Contains(projectHint, StringComparison.OrdinalIgnoreCase)
+                        || m.Symbol.ContainingAssembly?.Name.Contains(projectHint, StringComparison.OrdinalIgnoreCase) == true)
+            .ToList();
+        return narrowed.Count > 0 ? narrowed : matches;
+    }
+
+    /// <summary>Splits a trailing 'Name@ProjectHint' discriminator off a query (top level only, and
+    /// not a leading verbatim-identifier '@'). Returns the bare query and the hint (or null).</summary>
+    private static (string Query, string? Hint) SplitProjectHint(string query)
+    {
+        var depth = 0;
+        for (var i = query.Length - 1; i > 0; i--)
+        {
+            var c = query[i];
+            if (c is ')' or '>' or ']')
+                depth++;
+            else if (c is '(' or '<' or '[')
+                depth--;
+            else if (c == '@' && depth == 0)
+            {
+                var prev = query[i - 1];
+                if (char.IsLetterOrDigit(prev) || prev is '_' or ')' or '>' or ']')
+                {
+                    var hint = query[(i + 1)..].Trim();
+                    if (hint.Length > 0 && !hint.Contains('(') && !hint.Contains('<'))
+                        return (query[..i].Trim(), hint);
+                }
+                return (query, null);
+            }
+        }
+        return (query, null);
+    }
+
+    /// <summary>All source declarations matching a query (every project flavor, undeduped) — used by
+    /// scans that must enumerate members from each flavor rather than resolve to a single symbol.</summary>
+    public static Task<List<ResolvedSymbol>> FindAllSourceMatchesAsync(Solution solution, string query, CancellationToken ct)
+    {
+        (query, _) = SplitProjectHint(query.Trim());
+        return FindSourceMatchesAsync(solution, ParseQuery(query), ct);
     }
 
     // ---------------------------------------------------------------- query parsing
@@ -398,7 +453,7 @@ public static class SymbolResolver
         var asType = FindMetadataType(compilation, parsed.Segments, parsed.Arity);
         if (asType is not null && !parsed.IsConstructor && parsed.ParameterTypes is null)
         {
-            if (seenAssemblies.Add($"{asType.ContainingAssembly?.Name}|{asType.GetDocumentationCommentId()}"))
+            if (seenAssemblies.Add($"{AssemblyIdentityOf(asType)}|{asType.GetDocumentationCommentId()}"))
                 results.Add(new ResolvedSymbol(asType, project));
             return;
         }
@@ -416,10 +471,15 @@ public static class SymbolResolver
 
         foreach (var member in members.Where(m => MatchesParameters(m, parsed.ParameterTypes)))
         {
-            if (seenAssemblies.Add($"{member.ContainingAssembly?.Name}|{member.GetDocumentationCommentId()}"))
+            if (seenAssemblies.Add($"{AssemblyIdentityOf(member)}|{member.GetDocumentationCommentId()}"))
                 results.Add(new ResolvedSymbol(member, project));
         }
     }
+
+    // Full assembly identity (name + version + culture + key), so two projects referencing different
+    // versions of the same package are not deduped into one — they are genuinely different symbols.
+    private static string AssemblyIdentityOf(ISymbol symbol) =>
+        symbol.ContainingAssembly?.Identity.GetDisplayName() ?? "?";
 
     /// <summary>Projects deduplicated by project file (multi-TFM projects appear once per TFM).</summary>
     public static IEnumerable<Project> DistinctByProjectFile(Solution solution) =>
