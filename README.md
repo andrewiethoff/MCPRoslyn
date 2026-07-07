@@ -41,24 +41,26 @@ Text search can't tell you who implements an interface, which of 300 `Process` m
 
 ## Install
 
-### From source
+**📖 Full step-by-step guide (every harness, exact commands, configuration): [docs/INSTALL.md](docs/INSTALL.md).**
+
+Three ways to get the server, each giving a `command` + `args` you drop into any MCP host:
+
+| How | command | args |
+|---|---|---|
+| From NuGet via `dnx` (once published; nothing to install) | `dnx` | `MCPRoslyn --yes` |
+| Global .NET tool — `dotnet tool install --global MCPRoslyn` | `mcp-roslyn` | _(none)_ |
+| From source — `dotnet build -c Release src/McpRoslyn` | `dotnet` | `<abs>/src/McpRoslyn/bin/Release/net10.0/McpRoslyn.dll` |
+
+Quick start for **Claude Code** (see the guide for VS Code / Visual Studio / GitHub Copilot Coding Agent / Codex):
 
 ```bash
-git clone https://github.com/andrewiethoff/MCPRoslyn
-cd MCPRoslyn
+# from source today; swap in `dnx MCPRoslyn --yes` once the package is on NuGet
+git clone https://github.com/andrewiethoff/MCPRoslyn && cd MCPRoslyn
 dotnet build -c Release src/McpRoslyn
-claude mcp add --scope user roslyn -- dotnet "<abs-path>/src/McpRoslyn/bin/Release/net10.0/McpRoslyn.dll"
+claude mcp add --scope user roslyn -- dotnet "$PWD/src/McpRoslyn/bin/Release/net10.0/McpRoslyn.dll"
 ```
 
-### As a dotnet tool (once published to NuGet)
-
-```bash
-claude mcp add --scope user roslyn -- dnx MCPRoslyn --yes
-```
-
-For other MCP hosts (VS Code, Visual Studio, Cursor), configure a stdio server with command `dotnet` and the DLL path as the argument.
-
-On startup the server auto-discovers the solution at/above the working directory (Claude Code's project dir) and loads it in the background. Use `load_solution` to switch, `MCPROSLYN_SOLUTION=<path>` to pin, or `MCPROSLYN_AUTOLOAD=0` to disable.
+On startup the server auto-discovers the solution at/above the working directory (Claude Code's project dir; other hosts' current folder) and loads it in the background — **no configuration needed** in the common case. To pin one explicitly set `MCPROSLYN_SOLUTION=<path>`, switch at runtime with the `load_solution` tool, or disable auto-load with `MCPROSLYN_AUTOLOAD=0`. Details in [docs/INSTALL.md](docs/INSTALL.md#4-which-solution-gets-analyzed-configuration).
 
 ## What it deliberately does NOT do
 
