@@ -45,19 +45,18 @@ Text search can't tell you who implements an interface, which of 300 `Process` m
 
 Three ways to get the server, each giving a `command` + `args` you drop into any MCP host:
 
+[![NuGet](https://img.shields.io/nuget/v/MCPRoslyn.svg)](https://www.nuget.org/packages/MCPRoslyn)
+
 | How | command | args |
 |---|---|---|
-| From NuGet via `dnx` (once published; nothing to install) | `dnx` | `MCPRoslyn --yes` |
+| From NuGet via `dnx` (recommended; nothing to install) | `dnx` | `MCPRoslyn --yes` |
 | Global .NET tool — `dotnet tool install --global MCPRoslyn` | `mcp-roslyn` | _(none)_ |
 | From source — `dotnet build -c Release src/McpRoslyn` | `dotnet` | `<abs>/src/McpRoslyn/bin/Release/net10.0/McpRoslyn.dll` |
 
-Quick start for **Claude Code** (see the guide for VS Code / Visual Studio / GitHub Copilot Coding Agent / Codex):
+Quick start for **Claude Code** (needs the .NET 10 SDK, which provides `dnx`; see the guide for VS Code / Visual Studio / GitHub Copilot Coding Agent / Codex):
 
 ```bash
-# from source today; swap in `dnx MCPRoslyn --yes` once the package is on NuGet
-git clone https://github.com/andrewiethoff/MCPRoslyn && cd MCPRoslyn
-dotnet build -c Release src/McpRoslyn
-claude mcp add --scope user roslyn -- dotnet "$PWD/src/McpRoslyn/bin/Release/net10.0/McpRoslyn.dll"
+claude mcp add --scope user roslyn -- dnx MCPRoslyn --yes
 ```
 
 On startup the server auto-discovers the solution at/above the working directory (Claude Code's project dir; other hosts' current folder) and loads it in the background — **no configuration needed** in the common case. To pin one explicitly set `MCPROSLYN_SOLUTION=<path>`, switch at runtime with the `load_solution` tool, or disable auto-load with `MCPROSLYN_AUTOLOAD=0`. Details in [docs/INSTALL.md](docs/INSTALL.md#4-which-solution-gets-analyzed-configuration).

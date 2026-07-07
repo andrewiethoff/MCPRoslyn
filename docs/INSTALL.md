@@ -83,10 +83,11 @@ dotnet pack -c Release src/McpRoslyn                 # -> src/McpRoslyn/bin/Rele
 dotnet tool install --global --add-source src/McpRoslyn/bin/Release MCPRoslyn
 ```
 
-> **Until `MCPRoslyn` is on nuget.org**, options A and B won't resolve yet — use **Option C**
-> (from source, or a locally-packed nupkg). Publishing is automated: pushing a GitHub Release
-> tagged `vX.Y.Z` runs `.github/workflows/publish.yml`, which packs and pushes to nuget.org via
-> trusted publishing. After that first release, A and B work everywhere.
+> **`MCPRoslyn` is published on [nuget.org](https://www.nuget.org/packages/MCPRoslyn)**, so options
+> A (`dnx`) and B (global tool) work everywhere — they're the recommended path. Option C (from
+> source) is for local development or trying unreleased changes. New versions publish automatically:
+> pushing a GitHub Release tagged `vX.Y.Z` runs `.github/workflows/publish.yml`, which packs and
+> pushes to nuget.org via trusted publishing (OIDC, no stored API key).
 
 ---
 
